@@ -33,6 +33,9 @@ ingress:
   mode: virtualserver
   host: buzz.relay.tools
   tlsClusterIssuer: letsencrypt-prod
+  # Big enough for a full-history git push of this fork (~400MB pack); the
+  # relay's own cap (BUZZ_GIT_MAX_PACK_BYTES, 500MiB) is the real backstop.
+  clientMaxBodySize: "520m"
 
 # NIP-AB device pairing (desktop ↔ mobile QR pairing). The VirtualServer
 # routes /pair to this service; the relay advertises the URL via NIP-11.
