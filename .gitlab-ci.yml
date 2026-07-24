@@ -1,9 +1,9 @@
 # GitLab CI for the relay.tools fork — builds distributable artifacts.
 #
-# Scope (first iteration): Linux desktop bundles (deb + AppImage + binary
-# tarball + Arch package) and the signed Android APK. macOS/Windows/iOS need
-# platform runners this instance doesn't have; docker images are deliberately
-# out of scope for now.
+# Scope: Linux desktop bundles (deb + AppImage + binary tarball + Arch
+# package), a cross-compiled Windows NSIS installer, and the signed Android
+# APK. macOS/iOS need Apple runners this instance doesn't have; docker images
+# are deliberately out of scope for now.
 #
 # Recipes are ported from .github/workflows/release.yml (release-linux job).
 # Builds are unsigned on the Tauri-updater side (no TAURI_SIGNING_PRIVATE_KEY
@@ -149,6 +149,106 @@ arch-pkg:
       curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$PKGFILE" "$URL"
       echo
       echo "Install with: sudo pacman -U ${NAME}"
+
+# Cross-compiles the Windows desktop app from a Linux pod — no Windows runner
+# needed. Tauri v2 supports this officially (flagged experimental, NSIS only):
+# cargo-xwin fetches the MSVC CRT + Windows SDK and drives clang-cl/lld-link,
+# system makensis assembles the installer. Sidecar set matches upstream's
+# windows-canary.yml (mesh-llm is deliberately excluded on Windows), and
+# scripts/bundle-sidecars.sh already understands windows triples. The
+# installer is unsigned, so SmartScreen shows an "unknown publisher" warning;
+# WebView2 uses the default downloadBootstrapper mode (fetched at install
+# time, not build time).
+desktop-windows:
+  stage: build
+  # 24.04 (not 22.04 like desktop-linux): the linux job pins old glibc for
+  # runtime compat, but this job emits Windows PE binaries, so prefer the
+  # newer clang/lld for better MSVC compatibility.
+  image: ubuntu:24.04
+  timeout: 3h
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+    TARGET: x86_64-pc-windows-msvc
+    # Same hermit/cargo cache story as desktop-linux (see comment there).
+    HERMIT_STATE_DIR: "$CI_PROJECT_DIR/.hermit-state"
+    # cargo-xwin unpacks the MSVC CRT + Windows SDK here; keep it inside the
+    # project dir so runner cache holds it.
+    XWIN_CACHE_DIR: "$CI_PROJECT_DIR/.xwin-cache"
+    # aws-lc-sys ships CMake scripts older than hermit cmake 4.x's compat
+    # floor; upstream's windows job sets the same escape hatch.
+    CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+  cache:
+    key: desktop-windows-toolchain
+    paths:
+      - .hermit-state/
+      - .hermit/rust/
+      - .xwin-cache/
+    when: always
+  before_script:
+    - |
+      apt-get update -o Acquire::Retries=3
+      apt-get install -y --no-install-recommends \
+        build-essential ca-certificates clang curl file git lld llvm \
+        nasm ninja-build nsis wget zip
+    # Pinned cargo-xwin (prebuilt musl binary, same pin style as appimagetool).
+    - |
+      wget -q --tries=3 --timeout=30 -O /tmp/cargo-xwin.tar.gz \
+        "https://github.com/rust-cross/cargo-xwin/releases/download/v0.23.0/cargo-xwin-v0.23.0.x86_64-unknown-linux-musl.tar.gz"
+      echo "74a216f64f10ea81c909f02d6b1a84cd0fda8de4c87ee52fe63ba76ab2392b75  /tmp/cargo-xwin.tar.gz" | sha256sum -c
+      tar -C /usr/local/bin -xzf /tmp/cargo-xwin.tar.gz cargo-xwin
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - . ./bin/activate-hermit
+    - rustup target add "$TARGET"
+  script:
+    - just desktop-install-ci
+    - cargo xwin build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+    - ./scripts/bundle-sidecars.sh "$TARGET"
+    # xwin lowercases the splatted SDK lib filenames, but the sherpa-onnx
+    # prebuilt static libs embed a /DEFAULTLIB:"PathCch.lib" directive with
+    # original casing, which lld-link can't resolve on a case-sensitive
+    # filesystem. Scanning the prebuilt shows PathCch is its only mixed-case
+    # directive. The splat exists by now (the sidecar build above created it).
+    - ln -sf pathcch.lib .xwin-cache/xwin/sdk/lib/um/x86_64/PathCch.lib
+    # CFLAGS: opus (audiopus_sys, huddle audio) compiles SSE4.1/SSSE3 files
+    # with no arch flags because its CMake detects an MSVC frontend, which
+    # tolerates that; clang-cl's backend enforces target features and errors.
+    # -msse4.1 fixes it, at the cost of an SSE4.1 (2008+) CPU floor for the
+    # desktop app's C deps — WebView2 (Chromium) effectively requires that
+    # hardware anyway. Plain CFLAGS (not cc's CFLAGS_<target>) because
+    # cargo-xwin injects a CMAKE_TOOLCHAIN_FILE, which makes the cmake crate
+    # skip cc-derived flags; CMake itself still appends env CFLAGS at
+    # configure time. Scoped to this step so the CLI zip keeps the default
+    # baseline.
+    - (cd desktop && CFLAGS="-msse4.1" CXXFLAGS="-msse4.1" pnpm tauri build --verbose --ci --runner cargo-xwin --target "$TARGET" --bundles nsis)
+    - |
+      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      EXE=$(find "desktop/src-tauri/target/${TARGET}/release/bundle/nsis" -name '*.exe' -type f | head -1)
+      [ -n "$EXE" ] || { echo "No NSIS installer produced"; exit 1; }
+      mkdir -p dist
+      cp "$EXE" "dist/buzz-${VERSION}-windows-x86_64-setup.exe"
+    # CLI/sidecar bundle mirroring the Linux binary tarball, as a zip because
+    # that's the native archive shape on Windows (no +x bits to preserve).
+    - |
+      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      STAGE="buzz-${VERSION}-windows-x86_64"
+      mkdir -p "dist-bin/${STAGE}"
+      for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
+        cp "target/${TARGET}/release/${bin}.exe" "dist-bin/${STAGE}/"
+      done
+      cp "desktop/src-tauri/target/${TARGET}/release/buzz-desktop.exe" "dist-bin/${STAGE}/"
+      (cd dist-bin && zip -qr "../dist/${STAGE}.zip" "${STAGE}")
+      (cd dist && sha256sum * > SHA256SUMS)
+      ls -lh dist/
+    - |
+      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      for f in dist/*; do
+        NAME=$(basename "$f")
+        URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-windows/${VERSION}/${NAME}"
+        echo "Uploading ${NAME} -> ${URL}"
+        curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" "$URL"
+        echo
+      done
+      echo "Published under Deploy → Package registry → buzz-desktop-windows ${VERSION}"
 
 android-apk:
   stage: build
