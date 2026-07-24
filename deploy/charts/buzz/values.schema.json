@@ -138,10 +138,16 @@
       "additionalProperties": true,
       "properties": {
         "enabled": { "type": "boolean" },
+        "mode": { "type": "string", "enum": ["", "virtualserver"] },
         "className": { "type": "string" },
         "annotations": { "type": "object" },
+        "host": { "type": "string" },
         "hosts": { "type": "array" },
-        "tls": { "type": "array" }
+        "tls": { "type": "array" },
+        "tlsClusterIssuer": { "type": "string" },
+        "readTimeout": { "type": "string" },
+        "sendTimeout": { "type": "string" },
+        "clientMaxBodySize": { "type": "string" }
       }
     },
     "httproute": {

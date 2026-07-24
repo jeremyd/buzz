@@ -1,0 +1,47 @@
+{{- include "buzz.validate" . -}}
+{{- if and .Values.ingress.enabled (eq (.Values.ingress.mode | default "") "virtualserver") -}}
+# F5 NGINX Ingress Controller VirtualServer CRD (ingress.mode=virtualserver) — TLS via
+# cert-manager, long timeouts for websocket streams. The default mode renders a standard
+# Ingress instead (templates/ingress.yaml).
+apiVersion: k8s.nginx.org/v1
+kind: VirtualServer
+metadata:
+  name: {{ include "buzz.fullname" . }}
+  labels:
+    {{- include "buzz.labels" . | nindent 4 }}
+spec:
+  host: {{ .Values.ingress.host | default (include "buzz.relayHost" .) | quote }}
+  tls:
+    secret: {{ include "buzz.fullname" . }}-tls
+    cert-manager:
+      cluster-issuer: {{ .Values.ingress.tlsClusterIssuer | quote }}
+      issue-temp-cert: true
+    redirect:
+      enable: true
+  upstreams:
+    - name: relay
+      service: {{ include "buzz.fullname" . }}
+      port: {{ .Values.service.port }}
+      connect-timeout: 60s
+      read-timeout: {{ .Values.ingress.readTimeout | quote }}
+      send-timeout: {{ .Values.ingress.sendTimeout | quote }}
+      client-max-body-size: {{ .Values.ingress.clientMaxBodySize | quote }}
+    {{- if .Values.pairingRelay.enabled }}
+    - name: pairing
+      service: {{ include "buzz.fullname" . }}-pairing
+      port: {{ .Values.pairingRelay.service.port }}
+      connect-timeout: 60s
+      read-timeout: {{ .Values.ingress.readTimeout | quote }}
+      send-timeout: {{ .Values.ingress.sendTimeout | quote }}
+    {{- end }}
+  routes:
+    {{- if .Values.pairingRelay.enabled }}
+    # NIP-AB device pairing relay (accepts the WS upgrade on any path).
+    - path: /pair
+      action:
+        pass: pairing
+    {{- end }}
+    - path: /
+      action:
+        pass: relay
+{{- end }}

@@ -1,5 +1,5 @@
 {{- include "buzz.validate" . -}}
-{{- if .Values.ingress.enabled -}}
+{{- if and .Values.ingress.enabled (ne (.Values.ingress.mode | default "") "virtualserver") -}}
 {{- $fullName := include "buzz.fullname" . -}}
 {{- $svcPort := .Values.service.port -}}
 {{- $defaultHost := include "buzz.relayHost" . -}}

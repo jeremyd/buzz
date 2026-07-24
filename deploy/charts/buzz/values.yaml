@@ -253,10 +253,22 @@ podDisruptionBudget:
 # Mutually exclusive with httproute.enabled.
 ingress:
   enabled: false
+  # "" (default) renders a standard networking.k8s.io/v1 Ingress.
+  # "virtualserver" renders an F5 NGINX Ingress Controller VirtualServer CRD
+  # instead (templates/virtualserver.yaml) — TLS via cert-manager's native NIC
+  # integration, websocket-friendly timeouts. The keys below the marker apply
+  # only to virtualserver mode.
+  mode: ""
   className: ""
   annotations: {}
   hosts: []                      # empty → derived from relayUrl
   tls: []                        # [{hosts: [...], secretName: "..."}]
+  # virtualserver mode only:
+  host: ""                       # empty → derived from relayUrl
+  tlsClusterIssuer: ""           # cert-manager ClusterIssuer (e.g. letsencrypt-prod)
+  readTimeout: "3600s"           # long-lived websocket streams
+  sendTimeout: "3600s"
+  clientMaxBodySize: "120m"      # above the 100 MiB media upload cap
 
 # ── Gateway API (HTTPRoute) ──────────────────────────────────────────────────
 httproute:
