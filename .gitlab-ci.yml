@@ -76,9 +76,23 @@ desktop-linux:
       mkdir -p dist
       cp desktop/src-tauri/target/release/bundle/deb/*.deb dist/
       cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage dist/
-      ls -lh dist/
+    # Plain binary tarball: desktop app + CLI/sidecar binaries in one dir,
+    # the same flat layout the deb installs into /usr/bin, so the desktop
+    # binary finds its sidecars when run from the extracted directory.
+    # A tarball (rather than loose binary uploads) keeps the +x bits intact.
     - |
       VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      STAGE="buzz-${VERSION}-linux-x86_64"
+      mkdir -p "dist-bin/${STAGE}"
+      cp target/release/buzz-acp target/release/buzz-agent target/release/buzz-dev-mcp \
+         target/release/git-credential-nostr target/release/buzz \
+         desktop/src-tauri/target/release/buzz-desktop \
+         "dist-bin/${STAGE}/"
+      strip "dist-bin/${STAGE}"/*
+      tar --owner=0 --group=0 -C dist-bin -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+      (cd dist && sha256sum * > SHA256SUMS)
+      ls -lh dist/
+    - |
       for f in dist/*; do
         NAME=$(basename "$f")
         URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-linux/${VERSION}/${NAME}"
