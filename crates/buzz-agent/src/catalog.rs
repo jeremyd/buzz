@@ -122,9 +122,9 @@ pub(crate) fn is_chat_capable_endpoint(name: &str) -> bool {
 /// Discover available models for a Databricks provider.
 ///
 /// Returns an empty vector when an authenticated catalog is valid but no
-/// visible entries remain after filtering. Returns `Err(AgentError::LlmAuth)`
-/// when no token is available (no static token, no PKCE cache). The helper
-/// itself never starts interactive authentication.
+/// visible entries remain after filtering. Errors when no static token is
+/// configured — interactive authentication was removed with the external
+/// login flows, so bring-your-own-token via env vars is the only auth path.
 ///
 /// For v2, the known-model fallback is used only when both catalog requests
 /// succeed empty and no filter is active. A filter is applied to v1 results
@@ -136,22 +136,15 @@ pub async fn discover_databricks_models(cfg: &Config) -> Result<Vec<ModelEntry>,
     discover_databricks_models_with_cache_dir(cfg, None).await
 }
 
-/// Discover Databricks models while storing PKCE credentials under an explicit
-/// cache root. `None` preserves buzz-agent's production cache location.
+/// Discover Databricks models. The cache-dir parameter is retained for API
+/// compatibility with callers that isolate per-build credential caches; with
+/// the interactive OAuth engine removed there is no on-disk credential cache,
+/// so it is unused.
 pub async fn discover_databricks_models_with_cache_dir(
     cfg: &Config,
-    cache_dir: Option<&Path>,
+    _cache_dir: Option<&Path>,
 ) -> Result<Vec<ModelEntry>, AgentError> {
-    let token_source = if matches!(cfg.provider, Provider::Databricks | Provider::DatabricksV2)
-        && cfg.api_key.is_empty()
-    {
-        crate::auth::PkceOAuthTokenSource::new(crate::llm::databricks_pkce_config(
-            &cfg.base_url,
-            cache_dir.map(Path::to_path_buf),
-        ))?
-    } else {
-        build_token_source(cfg)?
-    };
+    let token_source = build_token_source(cfg)?;
     discover_databricks_models_with_token_source(cfg, token_source).await
 }
 

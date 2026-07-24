@@ -651,19 +651,25 @@ fn is_databricks_provider_matches_both_variants() {
 }
 
 #[test]
-fn databricks_interactive_auth_launches_only_without_a_static_token() {
-    // Phase 2: both surfaces launch the browser flow when the token is empty;
-    // the surface distinction is now cooldown-only (asserted separately). A
-    // configured static token still short-circuits interactive auth entirely.
-    assert!(should_start_interactive_auth(""));
-    assert!(!should_start_interactive_auth("static-token"));
+fn databricks_interactive_auth_requires_explicit_intent_and_no_static_token() {
+    assert!(should_start_interactive_auth(
+        "",
+        DatabricksAuthIntent::InteractiveModelPicker
+    ));
+    assert!(!should_start_interactive_auth(
+        "",
+        DatabricksAuthIntent::PassiveDraftDiscovery
+    ));
+    assert!(!should_start_interactive_auth(
+        "static-token",
+        DatabricksAuthIntent::InteractiveModelPicker
+    ));
 }
 
 #[test]
 fn databricks_passive_auth_error_has_reachable_create_flow_guidance() {
     let error = databricks_sign_in_required_error();
-    assert!(error.contains("save this agent, then open its model picker"));
-    assert!(error.contains("buzz-agent auth databricks"));
+    assert!(error.contains("set DATABRICKS_TOKEN in agent settings"));
 }
 
 #[test]

@@ -1,12 +1,11 @@
 use std::collections::BTreeSet;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use reqwest::Client;
 use serde_json::{json, Map, Value};
 
-use crate::auth::{PkceOAuthConfig, PkceOAuthTokenSource, StaticTokenSource, TokenSource};
+use crate::auth::{StaticTokenSource, TokenSource};
 use crate::config::{
     is_openai_host, normalize_effort_for_anthropic_route, normalize_effort_for_databricks_v2,
     normalize_effort_for_provider, Config, OpenAiApi, Provider, ThinkingEffort,
@@ -14,12 +13,6 @@ use crate::config::{
 use crate::types::{
     AgentError, HistoryItem, LlmResponse, ProviderStop, ToolCall, ToolDef, ToolResultContent,
 };
-
-/// Databricks OAuth client_id — the public Databricks-published CLI client.
-/// PKCE-only, no secret. Same identifier goose uses, so a user's browser
-/// consent for `databricks-cli` covers buzz-agent too.
-const DATABRICKS_CLIENT_ID: &str = "databricks-cli";
-const DATABRICKS_OAUTH_SCOPES: &[&str] = &["all-apis", "offline_access"];
 
 const MAX_LLM_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_LLM_ERROR_BODY_BYTES: usize = 4 * 1024;
@@ -2034,48 +2027,27 @@ where
     )))
 }
 
-pub(crate) fn databricks_pkce_config(
-    host: &str,
-    cache_dir_override: Option<PathBuf>,
-) -> PkceOAuthConfig {
-    PkceOAuthConfig {
-        discovery_url: format!(
-            "{}/oidc/.well-known/oauth-authorization-server",
-            host.trim_end_matches('/')
-        ),
-        client_id: DATABRICKS_CLIENT_ID.into(),
-        scopes: DATABRICKS_OAUTH_SCOPES
-            .iter()
-            .map(|scope| (*scope).into())
-            .collect(),
-        cache_namespace: "databricks".into(),
-        cache_dir_override,
-    }
-}
-
 /// Build the `TokenSource` for the configured provider.
 ///
 /// - `Provider::Anthropic`: a static source seeded from `cfg.api_key`. It's
 ///   never read for Anthropic requests (those go through `post_anthropic` with
 ///   `x-api-key`), but Llm holds one to keep the field non-`Option`.
 /// - `Provider::OpenAi`: a static source over `OPENAI_COMPAT_API_KEY`.
-/// - `Provider::Databricks`: if `DATABRICKS_TOKEN` is set, a static source.
-///   Otherwise a `PkceOAuthTokenSource` pointed at the workspace's OIDC
-///   discovery URL. First request without a cached token triggers a browser
-///   flow; subsequent requests use the cache + refresh transparently.
+/// - `Provider::Databricks`: a static source over `DATABRICKS_TOKEN`. The
+///   interactive OAuth browser flow was removed with the rest of the external
+///   login flows — a workspace token in the environment is the supported path.
 pub(crate) fn build_token_source(cfg: &Config) -> Result<Arc<dyn TokenSource>, AgentError> {
     match cfg.provider {
         Provider::Anthropic | Provider::OpenAi | Provider::OpenRouter => {
             Ok(Arc::new(StaticTokenSource::new(cfg.api_key.clone())))
         }
         Provider::Databricks | Provider::DatabricksV2 => {
-            if !cfg.api_key.is_empty() {
-                return Ok(Arc::new(StaticTokenSource::new(cfg.api_key.clone())));
+            if cfg.api_key.is_empty() {
+                return Err(AgentError::Llm(
+                    "Databricks requires DATABRICKS_TOKEN to be set (interactive OAuth login is not supported)".into(),
+                ));
             }
-            Ok(PkceOAuthTokenSource::new(databricks_pkce_config(
-                &cfg.base_url,
-                None,
-            ))?)
+            Ok(Arc::new(StaticTokenSource::new(cfg.api_key.clone())))
         }
     }
 }

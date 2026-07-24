@@ -404,10 +404,11 @@ test-unit:
         #     include_str! and replays the full locked corpus as pure in-process
         #     tests; without it a manifest edit that diverges Rust from the
         #     corpus ships green.
-        #   * OAuth auth coordinator (lib concurrency matrix + databricks
-        #     integration tests): lock single-flight, cooldown, cross-process
-        #     crash recovery — infra-free via a stub OIDC provider and an
-        #     injected browser opener, no network or Postgres.
+        #   * databricks wire-envelope regressions (integration tests): the
+        #     static-token request shape sent to Databricks model serving —
+        #     infra-free via a stub HTTP server, no network or Postgres. (The
+        #     OAuth auth-coordinator suite was removed with the interactive
+        #     login flows.)
         cargo nextest run -p buzz-agent
         # Admin API auth-boundary tests (api::admin in buzz-relay): the NIP-98
         # duplicate-tag rejections, the Host/Origin replay-ordering causal pair,

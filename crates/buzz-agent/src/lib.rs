@@ -149,55 +149,11 @@ fn die(msg: String) -> ! {
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    if matches!(args.get(1).map(String::as_str), Some("auth")) {
-        return tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()?
-            .block_on(auth_subcommand(&args[2..]));
-    }
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(async_main());
     Ok(())
-}
-
-/// Authenticate to Databricks and store credentials under an optional explicit
-/// cache root. `None` preserves buzz-agent's production cache location.
-pub async fn authenticate_databricks_with_cache_dir(
-    host: &str,
-    cache_dir: Option<&std::path::Path>,
-) -> Result<(), AgentError> {
-    auth::PkceOAuthTokenSource::new(llm::databricks_pkce_config(
-        host,
-        cache_dir.map(std::path::Path::to_path_buf),
-    ))?
-    .interactive_login()
-    .await
-}
-
-pub async fn authenticate_databricks(host: &str) -> Result<(), AgentError> {
-    authenticate_databricks_with_cache_dir(host, None).await
-}
-
-/// `buzz-agent auth <provider>` — run the interactive auth flow for a
-/// provider and persist the result, then exit. Today this supports Databricks
-/// OAuth 2.0 PKCE. Reads `DATABRICKS_HOST` from env; needs a browser on the
-/// machine.
-async fn auth_subcommand(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let provider = args.first().map(String::as_str);
-    match provider {
-        Some("databricks" | "databricks_v2" | "databricks-v2") => {
-            let host = std::env::var("DATABRICKS_HOST")
-                .map_err(|_| "auth databricks: DATABRICKS_HOST required")?;
-            authenticate_databricks(&host).await?;
-            eprintln!("Authenticated. Token cached under ~/.config/buzz-agent/oauth/databricks/.");
-            Ok(())
-        }
-        Some(other) => Err(format!("auth: unknown provider {other:?}").into()),
-        None => Err("auth: provider required (try: buzz-agent auth databricks)".into()),
-    }
 }
 
 async fn async_main() {
