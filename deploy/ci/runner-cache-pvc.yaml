@@ -1,0 +1,23 @@
+# Persistent cache volume for GitLab CI build pods.
+#
+# Every build pod mounts this at /cache (see gitlab-runner-values.yaml), so
+# job caches (hermit toolchain, cargo registry/git) survive across builds
+# without an S3/MinIO backend. arrowhead is a single-node cluster, so a
+# ReadWriteOnce local-path volume is safely shared by concurrent build pods.
+#
+# Deleting this PVC deletes the cache (local-path reclaimPolicy: Delete) —
+# that is fine, the next build just cold-starts and repopulates it.
+#
+# Apply: kubectl apply -f runner-cache-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: runner-cache
+  namespace: gitlab-ci
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 50Gi

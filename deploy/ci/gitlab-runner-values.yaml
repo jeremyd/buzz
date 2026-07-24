@@ -1,0 +1,39 @@
+# Helm values for the gitlab-runner release on arrowhead (namespace: gitlab-ci).
+# Chart: gitlab/gitlab-runner (deployed: 0.90.1). Runner token lives in the
+# pre-existing k8s secret `gitlab-runner-token` — nothing secret in this file.
+#
+# Cache: no S3/MinIO. Build pods mount the `runner-cache` PVC
+# (runner-cache-pvc.yaml) at /cache and the runner stores cache archives
+# there (cache_dir). Cold start after PVC deletion is expected and fine.
+#
+# Apply (restarts the runner manager — in-flight jobs are killed, so wait
+# for running pipelines to finish first):
+#   helm upgrade gitlab-runner gitlab/gitlab-runner --version 0.90.1 \
+#     -n gitlab-ci -f gitlab-runner-values.yaml
+concurrent: 4
+gitlabUrl: https://code.relay.tools
+rbac:
+  create: true
+runners:
+  config: |
+    [[runners]]
+      environment = ["BUILDKIT_HOST=tcp://buildkitd.gitlab-ci.svc.cluster.local:1234"]
+      # Store cache archives on the PVC mounted below instead of the
+      # (ephemeral) build pod filesystem.
+      cache_dir = "/cache"
+      [runners.kubernetes]
+        namespace = "gitlab-ci"
+        image = "alpine:3.22"
+        cpu_request = "250m"
+        memory_request = "512Mi"
+        cpu_limit = "4"
+        # 12Gi: Android release builds (gradle 6g heap + kotlin daemon 3g + overhead)
+        memory_limit = "12Gi"
+        helper_cpu_request = "100m"
+        helper_memory_request = "128Mi"
+        [[runners.kubernetes.volumes.pvc]]
+          name = "runner-cache"
+          mount_path = "/cache"
+  secret: gitlab-runner-token
+serviceAccount:
+  create: true
