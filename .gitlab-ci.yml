@@ -1,0 +1,99 @@
+# GitLab CI for the relay.tools fork — builds distributable artifacts.
+#
+# Scope (first iteration): Linux desktop bundles (deb + AppImage) and the
+# signed Android APK. macOS/Windows/iOS need platform runners this instance
+# doesn't have; docker images are deliberately out of scope for now.
+#
+# Recipes are ported from .github/workflows/release.yml (release-linux job).
+# Builds are unsigned on the Tauri-updater side (no TAURI_SIGNING_PRIVATE_KEY
+# yet), which is fine because the default tauri.conf.json does not produce
+# updater artifacts. Android release APKs are signed with the fork's upload
+# keystore, vended via the BUZZ_ANDROID_UPLOAD_* CI variables.
+
+stages:
+  - build
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_TAG
+    - if: $CI_COMMIT_BRANCH
+
+desktop-linux:
+  stage: build
+  image: ubuntu:22.04
+  timeout: 3h
+  variables:
+    DEBIAN_FRONTEND: noninteractive
+    # AppImage tools are themselves AppImages; containers lack FUSE.
+    APPIMAGE_EXTRACT_AND_RUN: "1"
+    # Keep hermit + cargo state inside the project dir so runner cache can hold it.
+    HERMIT_STATE_DIR: "$CI_PROJECT_DIR/.hermit-state"
+    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
+  cache:
+    key: desktop-linux-toolchain
+    paths:
+      - .hermit-state/
+      - .cargo/registry/
+      - .cargo/git/
+    when: always
+  before_script:
+    - |
+      apt-get update -o Acquire::Retries=3
+      apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl desktop-file-utils file git \
+        libasound2-dev libayatana-appindicator3-dev libgtk-3-dev librsvg2-dev \
+        libssl-dev libwebkit2gtk-4.1-dev libxdo-dev patchelf pkg-config \
+        squashfs-tools wget xdg-utils
+    # Pinned appimagetool + type2 runtime (same pins as the GitHub release workflow).
+    - |
+      wget -q --tries=3 --timeout=30 -O /tmp/appimagetool \
+        "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+      echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  /tmp/appimagetool" | sha256sum -c
+      install -m 755 /tmp/appimagetool /usr/local/bin/appimagetool
+      wget -q --tries=3 --timeout=30 -O /tmp/appimage-runtime \
+        "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64"
+      echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  /tmp/appimage-runtime" | sha256sum -c
+      install -D -m 644 /tmp/appimage-runtime /usr/local/lib/appimage-runtime
+      export APPIMAGETOOL_RUNTIME_FILE=/usr/local/lib/appimage-runtime
+    - git config --global --add safe.directory "$CI_PROJECT_DIR"
+    - . ./bin/activate-hermit
+  script:
+    - just desktop-install-ci
+    - cargo build --release -p buzz-acp -p buzz-agent -p buzz-backend-kubernetes -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
+    - ./scripts/bundle-sidecars.sh
+    - (cd desktop && pnpm tauri build --verbose --ci --bundles deb,appimage)
+    - |
+      export APPIMAGETOOL_RUNTIME_FILE=/usr/local/lib/appimage-runtime
+      APPIMAGE=$(find desktop/src-tauri/target/release/bundle/appimage -name '*.AppImage' -type f | head -1)
+      [ -n "$APPIMAGE" ] || { echo "No AppImage produced"; exit 1; }
+      bash desktop/scripts/fix-appimage.sh "$APPIMAGE"
+    - |
+      mkdir -p dist
+      cp desktop/src-tauri/target/release/bundle/deb/*.deb dist/
+      cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage dist/
+      ls -lh dist/
+  artifacts:
+    name: "buzz-desktop-linux-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - dist/
+    expire_in: 30 days
+
+android-apk:
+  stage: build
+  # Matches the hermit-pinned Flutter version (bin/.flutter-3.41.7.pkg).
+  image: ghcr.io/cirruslabs/flutter:3.41.7
+  timeout: 1h
+  script:
+    - test -n "$BUZZ_ANDROID_UPLOAD_KEYSTORE_B64" || { echo "Missing BUZZ_ANDROID_UPLOAD_KEYSTORE_B64 CI variable"; exit 1; }
+    - export BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH="$CI_PROJECT_DIR/upload-keystore.jks"
+    - echo "$BUZZ_ANDROID_UPLOAD_KEYSTORE_B64" | base64 -d > "$BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH"
+    - cd mobile
+    - flutter --version
+    - flutter pub get
+    - flutter build apk --release
+    - ls -lh build/app/outputs/flutter-apk/
+  artifacts:
+    name: "buzz-android-$CI_COMMIT_SHORT_SHA"
+    paths:
+      - mobile/build/app/outputs/flutter-apk/app-release.apk
+    expire_in: 30 days
