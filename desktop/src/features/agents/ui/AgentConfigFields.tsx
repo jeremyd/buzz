@@ -108,6 +108,8 @@ export function resolveDisclosure(disclosure: AgentConfigDisclosure) {
   const full = disclosure !== "onboarding-essential";
   return {
     showAdvancedFields: full,
+    // API keys are Settings-only config — never asked for during onboarding.
+    showApiKeyField: full,
     showCustomModelOption: full,
     showCustomProviderOption: full,
     showDescriptions: full,
@@ -228,6 +230,7 @@ export function AgentConfigFields({
   const shouldReduceMotion = useReducedMotion();
   const {
     showAdvancedFields,
+    showApiKeyField,
     showCustomModelOption,
     showCustomProviderOption,
     showDescriptions,
@@ -772,7 +775,7 @@ export function AgentConfigFields({
 
   const dependentContent = (
     <>
-      {providerFieldVisible && apiKeyEnvVar ? (
+      {providerFieldVisible && apiKeyEnvVar && showApiKeyField ? (
         <div className={blockClassName}>
           <PersonaProviderApiKeyField
             disabled={false}

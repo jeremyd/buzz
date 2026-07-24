@@ -50,6 +50,8 @@ test("onboarding-essential hides power tools but never the effort field", () => 
   const essential = resolveDisclosure("onboarding-essential");
   assert.deepEqual(essential, {
     showAdvancedFields: false,
+    // Credential entry (API keys) is Settings-only; onboarding never asks.
+    showApiKeyField: false,
     showCustomModelOption: false,
     showCustomProviderOption: false,
     showDescriptions: false,
