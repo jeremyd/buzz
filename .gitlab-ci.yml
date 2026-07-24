@@ -9,6 +9,11 @@
 # yet), which is fine because the default tauri.conf.json does not produce
 # updater artifacts. Android release APKs are signed with the fork's upload
 # keystore, vended via the BUZZ_ANDROID_UPLOAD_* CI variables.
+#
+# Binaries are published to the project's generic package registry
+# (Deploy → Package registry) instead of job artifacts: the instance caps
+# job artifacts at ~100 MB and the AppImage alone exceeds that. Package
+# version is the tag when building a tag, else 0.0.0-<short-sha>.
 
 stages:
   - build
@@ -72,11 +77,16 @@ desktop-linux:
       cp desktop/src-tauri/target/release/bundle/deb/*.deb dist/
       cp desktop/src-tauri/target/release/bundle/appimage/*.AppImage dist/
       ls -lh dist/
-  artifacts:
-    name: "buzz-desktop-linux-$CI_COMMIT_SHORT_SHA"
-    paths:
-      - dist/
-    expire_in: 30 days
+    - |
+      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      for f in dist/*; do
+        NAME=$(basename "$f")
+        URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-linux/${VERSION}/${NAME}"
+        echo "Uploading ${NAME} -> ${URL}"
+        curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$f" "$URL"
+        echo
+      done
+      echo "Published under Deploy → Package registry → buzz-desktop-linux ${VERSION}"
 
 android-apk:
   stage: build
@@ -85,15 +95,19 @@ android-apk:
   timeout: 1h
   script:
     - test -n "$BUZZ_ANDROID_UPLOAD_KEYSTORE_B64" || { echo "Missing BUZZ_ANDROID_UPLOAD_KEYSTORE_B64 CI variable"; exit 1; }
-    - export BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH="$CI_PROJECT_DIR/upload-keystore.jks"
+    # The gradle config refuses keystores inside the repo — keep it in /tmp.
+    - export BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH="/tmp/upload-keystore.jks"
     - echo "$BUZZ_ANDROID_UPLOAD_KEYSTORE_B64" | base64 -d > "$BUZZ_ANDROID_UPLOAD_KEYSTORE_PATH"
     - cd mobile
     - flutter --version
     - flutter pub get
     - flutter build apk --release
     - ls -lh build/app/outputs/flutter-apk/
-  artifacts:
-    name: "buzz-android-$CI_COMMIT_SHORT_SHA"
-    paths:
-      - mobile/build/app/outputs/flutter-apk/app-release.apk
-    expire_in: 30 days
+    - |
+      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      APK="build/app/outputs/flutter-apk/app-release.apk"
+      URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-android/${VERSION}/buzz-${VERSION}.apk"
+      echo "Uploading APK -> ${URL}"
+      curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$APK" "$URL"
+      echo
+      echo "Published under Deploy → Package registry → buzz-android ${VERSION}"
