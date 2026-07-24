@@ -1,0 +1,44 @@
+# arrowhead dev namespace (ns `buzz`): quickstart bundled services, single
+# replica, image built in-cluster (deploy/dev/, `just wb-image`) and pushed to
+# the relay.tools GitLab registry. Ingress is the cluster-standard F5 NGINX IC
+# VirtualServer with cert-manager TLS.
+quickstart: true
+postgresql:
+  enabled: true
+redis:
+  enabled: true
+minio:
+  enabled: true
+
+relayUrl: wss://buzz.relay.tools
+# buzztest — dedicated testing keyset (secret in gitignored buzztest.env at repo root)
+ownerPubkey: "1242da83d7a3d1e8989d347380678a20d6266b5d82b50ae3390db9c65484b78f"
+
+relay:
+  # Serve the bundled repo-browser web UI at / (without this the web dist only
+  # serves /invite/<code> landing pages; / answers NIP-11/WebSocket).
+  extraEnv:
+    - name: BUZZ_SERVE_GIT_WEB_GUI
+      value: "true"
+
+image:
+  repository: registry.feeds.relay.tools/opensauce/buzz
+  tag: dev
+  pullPolicy: Always             # dev tags are mutable; always re-pull
+  pullSecrets:
+    - name: regcred
+
+ingress:
+  enabled: true
+  mode: virtualserver
+  host: buzz.relay.tools
+  tlsClusterIssuer: letsencrypt-prod
+
+# NIP-AB device pairing (desktop ↔ mobile QR pairing). The VirtualServer
+# routes /pair to this service; the relay advertises the URL via NIP-11.
+pairingRelay:
+  enabled: true
+  url: wss://buzz.relay.tools/pair
+
+podDisruptionBudget:
+  enabled: false

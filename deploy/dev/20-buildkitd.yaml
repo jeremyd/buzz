@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: buildkit-cache
+  namespace: buzz
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path   # adjust to your cluster's StorageClass (or delete for the default)
+  resources:
+    requests:
+      storage: 50Gi              # cargo-chef dependency layers are large
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: buildkitd
+  namespace: buzz
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: buildkitd
+  template:
+    metadata:
+      labels:
+        app: buildkitd
+    spec:
+      containers:
+        - name: buildkitd
+          image: moby/buildkit:latest
+          args:
+            - --addr
+            - tcp://0.0.0.0:1234
+          securityContext:
+            privileged: true
+          ports:
+            - containerPort: 1234
+          readinessProbe:
+            exec:
+              command: ["buildctl", "--addr", "tcp://127.0.0.1:1234", "debug", "workers"]
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 1Gi
+            limits:
+              cpu: "12"
+              memory: 16Gi
+          volumeMounts:
+            - name: cache
+              mountPath: /var/lib/buildkit
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: buildkit-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: buildkitd
+  namespace: buzz
+spec:
+  selector:
+    app: buildkitd
+  ports:
+    - port: 1234
+      targetPort: 1234

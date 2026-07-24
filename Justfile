@@ -2,6 +2,9 @@
 
 set dotenv-load := true
 
+# In-cluster dev workbench recipes (wb-*) — see deploy/dev/README.md
+import 'deploy/dev/wb.just'
+
 desktop_dir := "desktop"
 desktop_tauri_manifest := "desktop/src-tauri/Cargo.toml"
 web_dir := "web"

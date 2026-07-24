@@ -1,0 +1,172 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: workbench
+  namespace: buzz
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: workbench-admin
+  namespace: buzz
+subjects:
+  - kind: ServiceAccount
+    name: workbench
+    namespace: buzz
+roleRef:
+  kind: ClusterRole
+  name: admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: workbench-work
+  namespace: buzz
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path   # adjust to your cluster's StorageClass (or delete for the default)
+  resources:
+    requests:
+      storage: 100Gi             # rust target/ + hermit toolchains + cargo registry
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: workbench-setup
+  namespace: buzz
+data:
+  setup.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    TOOLS=/work/tools
+    mkdir -p "$TOOLS/bin" /work/cache /work/src /work/.docker
+    export PATH="$TOOLS/bin:$PATH"
+
+    # apt packages live in the container layer, not the PVC — (re)install on every
+    # pod start. Rust builds need a C toolchain + pkg-config; git for repo ops;
+    # the webkit/gtk set is for Tauri desktop builds (wb-desktop).
+    apt_deps() {
+      apt-get update -qq && apt-get install -y -qq \
+        build-essential git curl unzip pkg-config libssl-dev ca-certificates procps file \
+        libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+        libxdo-dev patchelf libasound2-dev openjdk-17-jdk-headless >/dev/null
+    }
+    command -v cc >/dev/null && command -v git >/dev/null || apt_deps
+
+    # Builds/tests run as non-root `dev` (wb-run uses runuser): permission-
+    # semantics tests (chmod 000 → expect EACCES) are meaningless as root.
+    # A real login shell (not /bin/sh) because buzz-terminal's env-fence
+    # tests need a passwd shell distinguishable from the /bin/sh fallback.
+    id dev >/dev/null 2>&1 || useradd -m -u 1001 -s /bin/bash dev
+    usermod -s /bin/bash dev
+    if [ ! -f /work/.chowned ]; then
+      echo "== chowning /work to dev (one-time) =="
+      chown -R dev:dev /work && touch /work/.chowned
+    fi
+
+    if [ ! -f "$TOOLS/.done" ]; then
+      echo "== installing toolchain to $TOOLS =="
+
+      # kubectl
+      KVER=$(curl -fsSL https://dl.k8s.io/release/stable.txt)
+      curl -fsSL "https://dl.k8s.io/release/${KVER}/bin/linux/amd64/kubectl" -o "$TOOLS/bin/kubectl"
+      chmod +x "$TOOLS/bin/kubectl"
+
+      # helm — pin the v3 line; the buzz chart targets helm 3 (v4 changed
+      # chart-v2 handling and `lookup` semantics)
+      HELM_VER=v3.19.0
+      curl -fsSL "https://get.helm.sh/helm-${HELM_VER}-linux-amd64.tar.gz" | tar -xz -C /tmp
+      mv /tmp/linux-amd64/helm "$TOOLS/bin/helm" && rm -rf /tmp/linux-amd64
+
+      # buildctl (client for buildkitd)
+      BK_VER=$(curl -fsSL https://api.github.com/repos/moby/buildkit/releases/latest | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4)
+      curl -fsSL "https://github.com/moby/buildkit/releases/download/${BK_VER}/buildkit-${BK_VER}.linux-amd64.tar.gz" | tar -xz -C /tmp
+      mv /tmp/bin/buildctl "$TOOLS/bin/buildctl"
+
+      touch "$TOOLS/.done"
+      echo "== toolchain installed =="
+    fi
+
+    # Android SDK for Flutter APK builds (mobile/). Separate marker so existing
+    # workbenches pick this up without re-running the main toolchain block.
+    # Owned by dev: gradle auto-installs the NDK into the SDK on first build.
+    if [ ! -f "$TOOLS/.android-done" ]; then
+      echo "== installing Android SDK to $TOOLS/android-sdk =="
+      export ANDROID_HOME="$TOOLS/android-sdk"
+      mkdir -p "$ANDROID_HOME/cmdline-tools"
+      CLT_URL=$(curl -fsSL https://developer.android.com/studio | grep -o 'https://dl.google.com/android/repository/commandlinetools-linux-[0-9]*_latest.zip' | head -1)
+      curl -fsSL "$CLT_URL" -o /tmp/clt.zip
+      unzip -q /tmp/clt.zip -d /tmp/clt-x
+      rm -rf "$ANDROID_HOME/cmdline-tools/latest"
+      mv /tmp/clt-x/cmdline-tools "$ANDROID_HOME/cmdline-tools/latest" && rm -rf /tmp/clt.zip /tmp/clt-x
+      yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+      "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install \
+        "platform-tools" "platforms;android-36" "build-tools;36.0.0" >/dev/null
+      chown -R dev:dev "$ANDROID_HOME"
+      touch "$TOOLS/.android-done"
+      echo "== Android SDK installed =="
+    fi
+
+    # Rust / Node / just / pnpm come from the repo's own hermit env — activate with
+    # `. ./bin/activate-hermit` inside /work/src/buzz. HERMIT_STATE_DIR keeps the
+    # downloaded toolchains on the PVC so they survive pod restarts.
+    kubectl version --client=true && helm version --short && buildctl --version
+    echo "workbench ready"
+    sleep infinity
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: workbench
+  namespace: buzz
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: workbench
+  template:
+    metadata:
+      labels:
+        app: workbench
+    spec:
+      serviceAccountName: workbench
+      containers:
+        - name: workbench
+          image: debian:bookworm
+          command: ["/bin/bash", "/setup/setup.sh"]
+          env:
+            - name: PATH
+              value: /work/tools/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+            - name: HERMIT_STATE_DIR
+              value: /work/cache/hermit
+            - name: ANDROID_HOME
+              value: /work/tools/android-sdk
+            - name: CARGO_HOME
+              value: /work/cache/cargo
+            - name: DOCKER_CONFIG
+              value: /work/.docker
+            - name: BUILDKIT_HOST
+              value: tcp://buildkitd:1234
+          workingDir: /work/src
+          resources:
+            requests:
+              cpu: "1"
+              memory: 2Gi
+            limits:
+              cpu: "12"
+              memory: 24Gi
+          volumeMounts:
+            - name: work
+              mountPath: /work
+            - name: setup
+              mountPath: /setup
+      volumes:
+        - name: work
+          persistentVolumeClaim:
+            claimName: workbench-work
+        - name: setup
+          configMap:
+            name: workbench-setup
