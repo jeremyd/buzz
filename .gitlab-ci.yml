@@ -32,14 +32,15 @@ desktop-linux:
     # AppImage tools are themselves AppImages; containers lack FUSE.
     APPIMAGE_EXTRACT_AND_RUN: "1"
     # Keep hermit + cargo state inside the project dir so runner cache can hold it.
+    # No CARGO_HOME here: hermit's rust package forces
+    # CARGO_HOME=${HERMIT_ENV}/.hermit/rust (see rust.hcl in hermit-packages),
+    # so cargo's registry/git caches land in .hermit/rust regardless.
     HERMIT_STATE_DIR: "$CI_PROJECT_DIR/.hermit-state"
-    CARGO_HOME: "$CI_PROJECT_DIR/.cargo"
   cache:
     key: desktop-linux-toolchain
     paths:
       - .hermit-state/
-      - .cargo/registry/
-      - .cargo/git/
+      - .hermit/rust/
     when: always
   before_script:
     - |

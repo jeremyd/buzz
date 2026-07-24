@@ -24,6 +24,11 @@ GitHub. The fix is deliberately simple — **a PVC, not S3/MinIO**:
 Losing the cache is harmless by design: delete the PVC (or the node dir
 behind it) and the next build cold-starts and repopulates it.
 
+The project's "use separate caches for protected branches" setting
+(`ci_separated_caches`) is disabled so feature branches share main's
+toolchain cache — this is a solo-maintainer fork, so cache poisoning
+from untrusted branches is not a concern.
+
 ## Applying changes
 
 ```sh
