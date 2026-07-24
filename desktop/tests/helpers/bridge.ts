@@ -161,8 +161,6 @@ type MockBridgeOptions = {
   relaySelf?: string | null;
   /** Native-like huddle state seeded from authoritative role-bearing membership. */
   huddle?: MockHuddleSeed;
-  /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
-  builderlabAuth?: { email?: string; name?: string; expiresAt: string } | null;
   /** Optional policy returned by the native join-policy discovery command. */
   joinPolicy?: {
     terms_markdown?: string;
@@ -170,16 +168,6 @@ type MockBridgeOptions = {
     age_attestation_required: boolean;
     version: string;
   } | null;
-  /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */
-  builderlabIdentity?: { npub?: string; pubkey_hex?: string } | null;
-  /** Communities owned by the mocked Builderlab account. */
-  builderlabCommunities?: Array<{
-    id?: string;
-    name?: string;
-    slug?: string;
-    normalized_host?: string;
-    archived_at?: string | null;
-  }>;
   acpRuntimesCatalog?: Record<string, unknown>[];
   /** Catalog returned after a successful mocked install. */
   acpRuntimesCatalogAfterInstall?: Record<string, unknown>[];
@@ -190,14 +178,9 @@ type MockBridgeOptions = {
   acpRuntimesDelayMs?: number;
   /** When true, the mock catalog discovery command throws an error. */
   acpRuntimesError?: boolean;
-  acpAuthMethods?: Record<string, { methods: Record<string, unknown>[] }>;
-  acpAuthMethodsError?: string;
   /** When set, the `delete_custom_harness` mock command throws with this message. */
   workflowUpdateError?: string;
   deleteCustomHarnessError?: string;
-  connectAcpRuntimeResult?: { launched: boolean };
-  connectAcpRuntimeDelayMs?: number;
-  connectAcpRuntimeError?: string;
   installAcpRuntimeDelayMs?: number;
   /** Live output lines the mocked install emits before it settles, in order.
    *  Each arrives as an `acp-install-output` event, preceded by the clear

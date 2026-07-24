@@ -10,7 +10,6 @@ import {
   FlaskConical,
   Keyboard,
   LayoutTemplate,
-  MessagesSquare,
   MonitorCog,
   Moon,
   ShieldAlert,
@@ -69,7 +68,6 @@ import { MobilePairingCard } from "./MobilePairingCard";
 import { ModerationQueueCard } from "./ModerationQueueCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
 import { AgentsSettingsPanel } from "./AgentsSettingsPanel";
-import { HostedCommunitiesSettingsCard } from "./HostedCommunitiesSettingsCard";
 import {
   SettingsOptionGroup,
   SettingsOptionGroupList,
@@ -91,7 +89,6 @@ export type SettingsSection =
   | "compute"
   | "appearance"
   | "shortcuts"
-  | "hosted-communities"
   | "community-members"
   | "moderation"
   | "custom-emoji"
@@ -111,7 +108,6 @@ const SETTINGS_SECTION_VALUES: readonly SettingsSection[] = [
   "compute",
   "appearance",
   "shortcuts",
-  "hosted-communities",
   "community-members",
   "moderation",
   "custom-emoji",
@@ -197,11 +193,6 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     value: "shortcuts",
     label: "Shortcuts",
     icon: Keyboard,
-  },
-  {
-    value: "hosted-communities",
-    label: "Hosted communities",
-    icon: MessagesSquare,
   },
   {
     value: "community-members",
@@ -842,8 +833,6 @@ export function renderSettingsSection(
       return <ThemeSettingsCard />;
     case "shortcuts":
       return <KeyboardShortcutsCard />;
-    case "hosted-communities":
-      return <HostedCommunitiesSettingsCard />;
     case "community-members":
       return (
         <CommunityMembersSettingsCard currentPubkey={props.currentPubkey} />

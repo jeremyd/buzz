@@ -77,10 +77,6 @@ import {
   KIND_USER_STATUS,
 } from "@/shared/constants/kinds";
 import type {
-  RawAcpAuthMethodsResult,
-  RawConnectAcpRuntimeResult,
-} from "@/shared/api/tauriAgentAuth";
-import type {
   RawAcpRuntimeCatalogEntry,
   RawInstallRuntimeResult,
   RuntimeFileConfigSubset,
@@ -219,12 +215,6 @@ type E2eConfig = {
     projectRepoSnapshotError?: string;
     /** Delay remote repository snapshots so project loading UI is observable. */
     projectRepoSnapshotDelayMs?: number;
-    /** Builderlab account returned by hosted-community onboarding. Null/omitted = signed out. */
-    builderlabAuth?: {
-      email?: string;
-      name?: string;
-      expiresAt: string;
-    } | null;
     /** Optional policy returned by the native join-policy discovery command. */
     joinPolicy?: {
       terms_markdown?: string;
@@ -232,28 +222,6 @@ type E2eConfig = {
       age_attestation_required: boolean;
       version: string;
     } | null;
-    /** Delay Builderlab login completion so cancellation/retry UI can be tested. */
-    builderlabLoginDelayMs?: number;
-    /** Bound Builderlab Nostr identity. Null/omitted = not linked yet. */
-    builderlabIdentity?: { npub?: string; pubkey_hex?: string } | null;
-    /** Structured error returned when onboarding tries to bind the local identity. */
-    builderlabBindError?: { code?: string; message?: string };
-    /** Communities owned by the mocked Builderlab account. */
-    builderlabCommunities?: Array<{
-      id?: string;
-      name?: string;
-      slug?: string;
-      normalized_host?: string;
-      archived_at?: string | null;
-    }>;
-    /** Override the community returned after hosted creation. */
-    builderlabCreatedCommunity?: {
-      id?: string;
-      name?: string;
-      slug?: string;
-      normalized_host?: string;
-      archived_at?: string | null;
-    };
     acpRuntimesCatalog?: RawAcpRuntimeCatalogEntry[];
     /** Catalog returned after a successful mocked install. */
     acpRuntimesCatalogAfterInstall?: RawAcpRuntimeCatalogEntry[];
@@ -264,9 +232,6 @@ type E2eConfig = {
     acpRuntimesDelayMs?: number;
     /** When true, the catalog discovery call throws — simulates a failed query. */
     acpRuntimesError?: boolean;
-    acpAuthMethods?: Record<string, RawAcpAuthMethodsResult>;
-    acpAuthMethodsErrors?: Record<string, string>;
-    acpAuthMethodsError?: string;
     /** When set, workflow updates fail with this message. */
     workflowUpdateError?: string;
     /** When set, workflow deletion fails with this message. */
@@ -275,11 +240,6 @@ type E2eConfig = {
     workflowTriggerError?: string;
     /** When set, the `delete_custom_harness` mock command throws with this message. */
     deleteCustomHarnessError?: string;
-    connectAcpRuntimeResult?: RawConnectAcpRuntimeResult;
-    connectAcpRuntimeDelayMs?: number;
-    connectAcpRuntimeError?: string;
-    /** Catalog returned after a successful mocked connect (sign-in). */
-    acpRuntimesCatalogAfterConnect?: RawAcpRuntimeCatalogEntry[];
     activePersonaIds?: string[];
     installAcpRuntimeDelayMs?: number;
     /** Live output lines the mocked install emits before it settles. */
@@ -8419,7 +8379,6 @@ function withMockRuntimeConfigMetadata(
 
 let runtimeCatalogDiscoveryCount = 0;
 let mockInstallCompleted = false;
-let mockConnectCompleted = false;
 
 async function handleDiscoverAcpRuntimes(
   config: E2eConfig | undefined,
@@ -8448,10 +8407,6 @@ async function handleDiscoverAcpRuntimes(
   const afterInstall = config?.mock?.acpRuntimesCatalogAfterInstall;
   if (mockInstallCompleted && afterInstall) {
     return afterInstall.map(withMockRuntimeConfigMetadata);
-  }
-  const afterConnect = config?.mock?.acpRuntimesCatalogAfterConnect;
-  if (mockConnectCompleted && afterConnect) {
-    return afterConnect.map(withMockRuntimeConfigMetadata);
   }
   const sequence = config?.mock?.acpRuntimesCatalogSequence;
   if (sequence && sequence.length > 0) {
@@ -8548,42 +8503,6 @@ async function handleDiscoverAcpRuntimes(
   return mergeMockCustomHarnesses(
     defaultCatalog.map(withMockRuntimeConfigMetadata),
   );
-}
-
-async function handleDiscoverAcpAuthMethods(
-  args: { runtimeId?: string },
-  config: E2eConfig | undefined,
-): Promise<RawAcpAuthMethodsResult> {
-  const globalError = config?.mock?.acpAuthMethodsError;
-  if (globalError) {
-    throw new Error(globalError);
-  }
-  const runtimeId = args.runtimeId ?? "";
-  const perRuntimeError = config?.mock?.acpAuthMethodsErrors?.[runtimeId];
-  if (perRuntimeError) {
-    throw new Error(perRuntimeError);
-  }
-  const configured = config?.mock?.acpAuthMethods?.[runtimeId];
-  if (configured) {
-    return configured;
-  }
-  return { methods: [] };
-}
-
-async function handleConnectAcpRuntime(
-  _args: { request?: { runtimeId?: string; methodId?: string } },
-  config: E2eConfig | undefined,
-): Promise<RawConnectAcpRuntimeResult> {
-  const error = config?.mock?.connectAcpRuntimeError;
-  if (error) {
-    throw new Error(error);
-  }
-  const delayMs = config?.mock?.connectAcpRuntimeDelayMs ?? 0;
-  if (delayMs > 0) {
-    await new Promise((resolve) => window.setTimeout(resolve, delayMs));
-  }
-  mockConnectCompleted = true;
-  return config?.mock?.connectAcpRuntimeResult ?? { launched: true };
 }
 
 // Per-page install call counter. Reset each test run because this module is
@@ -12420,62 +12339,6 @@ export function maybeInstallE2eTauriMocks() {
           registry: await handleMockCommand("list_voice_registry", null),
         };
       }
-      case "get_builderlab_auth":
-        return activeConfig?.mock?.builderlabAuth ?? null;
-      case "start_builderlab_login": {
-        const delayMs = activeConfig?.mock?.builderlabLoginDelayMs ?? 0;
-        if (delayMs > 0)
-          await new Promise((resolve) => window.setTimeout(resolve, delayMs));
-        const nextAuth = activeConfig?.mock?.builderlabAuth ?? {
-          email: "owner@example.com",
-          expiresAt: "2099-01-01T00:00:00Z",
-        };
-        if (activeConfig?.mock) activeConfig.mock.builderlabAuth = nextAuth;
-        return nextAuth;
-      }
-      case "cancel_builderlab_login":
-        return null;
-      case "clear_builderlab_auth":
-        if (activeConfig?.mock) activeConfig.mock.builderlabAuth = null;
-        return null;
-      case "get_builderlab_nostr_identity":
-        return activeConfig?.mock?.builderlabIdentity
-          ? { identity: activeConfig.mock.builderlabIdentity }
-          : { error: { code: "missing_mapping", setup_needed: true } };
-      case "bind_builderlab_nostr_identity": {
-        if (activeConfig?.mock?.builderlabBindError)
-          return { error: activeConfig.mock.builderlabBindError };
-        const activeIdentity = identity ?? DEFAULT_MOCK_IDENTITY;
-        const nextIdentity = {
-          pubkey_hex: activeIdentity.pubkey,
-          npub: `npub1${activeIdentity.pubkey}`,
-        };
-        if (activeConfig?.mock)
-          activeConfig.mock.builderlabIdentity = nextIdentity;
-        return { identity: nextIdentity };
-      }
-      case "delete_builderlab_nostr_identity":
-        if (activeConfig?.mock) activeConfig.mock.builderlabIdentity = null;
-        return {};
-      case "list_builderlab_communities":
-        return {
-          communities: activeConfig?.mock?.builderlabCommunities ?? [],
-        };
-      case "check_builderlab_community_name":
-        return {
-          available: true,
-          normalized_host: `${(payload as { name?: string })?.name ?? "community"}.communities.buzz.xyz`,
-        };
-      case "create_builderlab_community": {
-        const name = (payload as { name?: string })?.name ?? "community";
-        return {
-          community: activeConfig?.mock?.builderlabCreatedCommunity ?? {
-            id: `hosted-${name}`,
-            name,
-            normalized_host: `${name}.communities.buzz.xyz`,
-          },
-        };
-      }
       case "mesh_installed_models":
         return mockMeshState.models;
       case "mesh_model_catalog":
@@ -13451,16 +13314,6 @@ export function maybeInstallE2eTauriMocks() {
       case "delete_custom_harness":
         return handleDeleteCustomHarness(
           payload as Parameters<typeof handleDeleteCustomHarness>[0],
-          activeConfig,
-        );
-      case "discover_acp_auth_methods":
-        return handleDiscoverAcpAuthMethods(
-          payload as { runtimeId?: string },
-          activeConfig,
-        );
-      case "connect_acp_runtime":
-        return handleConnectAcpRuntime(
-          payload as { request?: { runtimeId?: string; methodId?: string } },
           activeConfig,
         );
       case "install_acp_runtime":

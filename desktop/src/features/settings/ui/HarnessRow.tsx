@@ -3,8 +3,6 @@ import { EllipsisVertical, ExternalLink } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import {
-  useAcpAuthMethodsQuery,
-  useConnectAcpRuntimeMutation,
   useDeleteCustomHarnessMutation,
   useInstallAcpRuntimeMutation,
   useManagedAgentsQuery,
@@ -12,7 +10,7 @@ import {
 } from "@/features/agents/hooks";
 import { useInstallOutputLine } from "@/features/agents/lib/useInstallOutputLine";
 import { RuntimeIcon } from "@/features/onboarding/ui/RuntimeIcon";
-import type { AcpAuthMethod, AcpRuntimeCatalogEntry } from "@/shared/api/types";
+import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { getInstallErrorMessage } from "@/shared/lib/installError";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -75,18 +73,10 @@ function RuntimeLogo({ runtime }: { runtime: AcpRuntimeCatalogEntry }) {
 }
 
 function RuntimeOverflowMenu({
-  authMethods,
-  connectingMethodId,
-  isConnecting,
-  onConnect,
   onDelete,
   onEdit,
   runtime,
 }: {
-  authMethods: AcpAuthMethod[];
-  connectingMethodId: string | null;
-  isConnecting: boolean;
-  onConnect: (method: AcpAuthMethod) => void;
   onDelete?: () => void;
   onEdit?: () => void;
   runtime: AcpRuntimeCatalogEntry;
@@ -99,7 +89,6 @@ function RuntimeOverflowMenu({
   const hasActions =
     runtime.nodeRequired ||
     hasInstructions ||
-    authMethods.length > 0 ||
     Boolean(onEdit) ||
     Boolean(onDelete);
 
@@ -123,18 +112,6 @@ function RuntimeOverflowMenu({
         align="end"
         onCloseAutoFocus={(event) => event.preventDefault()}
       >
-        {authMethods.map((method) => (
-          <DropdownMenuItem
-            disabled={isConnecting}
-            key={method.id}
-            onSelect={() => onConnect(method)}
-          >
-            {isConnecting && connectingMethodId === method.id ? (
-              <Spinner aria-hidden className="h-4 w-4 border-2" />
-            ) : null}
-            {method.name || method.id}
-          </DropdownMenuItem>
-        ))}
         {runtime.nodeRequired ? (
           <DropdownMenuItem onSelect={() => void openUrl("https://nodejs.org")}>
             <ExternalLink className="h-4 w-4" />
@@ -172,21 +149,13 @@ function RuntimeOverflowMenu({
 }
 
 function RuntimeActions({
-  authMethods,
-  connectingMethodId,
-  isConnecting,
   isInstalling,
-  onConnect,
   onDelete,
   onEdit,
   onInstall,
   runtime,
 }: {
-  authMethods: AcpAuthMethod[];
-  connectingMethodId: string | null;
-  isConnecting: boolean;
   isInstalling: boolean;
-  onConnect: (method: AcpAuthMethod) => void;
   onDelete?: () => void;
   onEdit?: () => void;
   onInstall: () => void;
@@ -199,23 +168,18 @@ function RuntimeActions({
   const isAuthNeeded =
     isAvailable && runtime.authStatus.status === "logged_out";
   const canInstall = runtime.canAutoInstall && !runtime.nodeRequired;
-  const isWorking = isInstalling || isConnecting;
 
   return (
     <div className="ml-auto flex shrink-0 items-center justify-end gap-1">
       <RuntimeOverflowMenu
-        authMethods={authMethods}
-        connectingMethodId={connectingMethodId}
-        isConnecting={isConnecting}
-        onConnect={onConnect}
         onDelete={onDelete}
         onEdit={onEdit}
         runtime={runtime}
       />
-      {isWorking ? (
+      {isInstalling ? (
         <div className="flex h-7 w-9 items-center justify-center text-muted-foreground">
           <Spinner
-            aria-label={`${runtime.label} ${isInstalling ? "installing" : "connecting"}`}
+            aria-label={`${runtime.label} installing`}
             className="h-4 w-4 border-2"
             data-testid={`doctor-runtime-loading-${runtime.id}`}
           />
@@ -291,8 +255,13 @@ function RuntimeStatusChip({ runtime }: { runtime: AcpRuntimeCatalogEntry }) {
  * One row in "Your runtimes".
  *
  * Carries the full operational surface for a ready (or one-click-ready)
- * harness: logo, status chip, auth/overflow menu, install/connect flows, and
- * — for custom harnesses — edit and delete with the blast-radius guard.
+ * harness: logo, status chip, overflow menu, install flow, and — for custom
+ * harnesses — edit and delete with the blast-radius guard.
+ *
+ * No connect-account actions: external account sign-in is out of scope
+ * (onboarding is Nostr-only). Read-only CLI login *detection* stays — a
+ * signed-out runtime carries the amber chip and a passive
+ * sign-in-with-its-CLI hint instead of an in-app connect flow.
  */
 export function HarnessRow({
   embedded = false,
@@ -304,9 +273,6 @@ export function HarnessRow({
   runtime: AcpRuntimeCatalogEntry;
 }) {
   const isCustom = runtime.source === "custom";
-  const [terminalLaunchMethodId, setTerminalLaunchMethodId] = React.useState<
-    string | null
-  >(null);
   const [isUpdateWarningOpen, setIsUpdateWarningOpen] = React.useState(false);
   const [editing, setEditing] = React.useState(false);
   const [confirmingDelete, setConfirmingDelete] = React.useState(false);
@@ -365,29 +331,9 @@ export function HarnessRow({
     });
   }
 
-  const canConnectAccount =
+  const isSignedOut =
     runtime.availability === "available" &&
     runtime.authStatus.status === "logged_out";
-  const authMethodsQuery = useAcpAuthMethodsQuery(runtime.id, {
-    enabled: canConnectAccount,
-  });
-  const authMethods = canConnectAccount
-    ? (authMethodsQuery.data?.methods ?? [])
-    : [];
-  const connectMutation = useConnectAcpRuntimeMutation();
-  const connectionError = connectMutation.error
-    ? `Couldn't connect ${runtime.label}: ${
-        connectMutation.error instanceof Error
-          ? connectMutation.error.message
-          : "Connection failed."
-      }`
-    : authMethodsQuery.error
-      ? `Couldn't load sign-in options: ${
-          authMethodsQuery.error instanceof Error
-            ? authMethodsQuery.error.message
-            : "Request failed."
-        }`
-      : null;
 
   if (editing) {
     return (
@@ -418,26 +364,7 @@ export function HarnessRow({
             </div>
           </div>
           <RuntimeActions
-            authMethods={authMethods}
-            connectingMethodId={connectMutation.variables?.methodId ?? null}
-            isConnecting={connectMutation.isPending}
             isInstalling={isInstalling}
-            onConnect={(method) => {
-              setTerminalLaunchMethodId(null);
-              connectMutation.mutate(
-                {
-                  runtimeId: runtime.id,
-                  methodId: method.id,
-                },
-                {
-                  onSuccess: (result) => {
-                    if (result.launched && method.type === "terminal") {
-                      setTerminalLaunchMethodId(method.id);
-                    }
-                  },
-                },
-              );
-            }}
             onDelete={
               isCustom
                 ? () => {
@@ -484,21 +411,13 @@ export function HarnessRow({
             {installError}
           </p>
         ) : null}
-        {connectionError ? (
-          <p
-            className="mt-2 whitespace-pre-line rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-1.5 text-sm text-destructive"
-            data-testid={`doctor-runtime-error-${runtime.id}`}
-          >
-            {connectionError}
-          </p>
-        ) : null}
-        {canConnectAccount && terminalLaunchMethodId ? (
+        {isSignedOut ? (
           <p
             className="mt-2 rounded-lg border border-border/60 bg-background/60 px-3 py-1.5 text-sm text-muted-foreground"
-            data-testid={`doctor-runtime-terminal-guidance-${runtime.id}`}
+            data-testid={`doctor-runtime-signed-out-${runtime.id}`}
           >
-            Finish signing in from the Terminal window, then click Check again
-            to re-check {runtime.label}.
+            Sign in with the {runtime.label} CLI in a terminal, then click Check
+            again.
           </p>
         ) : null}
         {confirmingDelete ? (

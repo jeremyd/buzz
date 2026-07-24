@@ -1,7 +1,6 @@
 import * as React from "react";
 import { Check, Copy } from "lucide-react";
 
-import { HostedCommunityOnboarding } from "@/features/communities/ui/HostedCommunityOnboarding";
 import { useCommunityOnboarding } from "@/features/onboarding/communityOnboarding";
 import { InviteRedeemForm } from "@/features/onboarding/ui/InviteRedeemForm";
 import { OnboardingChrome } from "@/features/onboarding/ui/OnboardingChrome";
@@ -18,7 +17,7 @@ import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { StartupWindowDragRegion } from "@/shared/ui/StartupWindowDragRegion";
 
-type WelcomeSetupPage = "welcome" | "existing" | "join" | "member" | "owned";
+type WelcomeSetupPage = "welcome" | "existing" | "join" | "member" | "create";
 type WelcomeTransitionMode = "initial" | OnboardingTransitionDirection;
 
 type WelcomeSetupProps = {
@@ -38,10 +37,6 @@ export function WelcomeSetup({
   const [page, setPage] = React.useState<WelcomeSetupPage>(initialPage);
   const [transitionMode, setTransitionMode] =
     React.useState<WelcomeTransitionMode>(initialTransitionMode);
-  // While true, the Builderlab sign-in modal floats over the current page —
-  // we only navigate to the hosted stage once sign-in completes, so the page
-  // behind the modal never changes out from under the user.
-  const [isHostedSignInOpen, setIsHostedSignInOpen] = React.useState(false);
   const [copiedNpub, setCopiedNpub] = React.useState(false);
   const communityOnboarding = useCommunityOnboarding();
   const identityQuery = useIdentityQuery();
@@ -87,11 +82,6 @@ export function WelcomeSetup({
       });
     },
     [communityOnboarding, page],
-  );
-
-  const beginHostedCommunity = React.useCallback(
-    () => setIsHostedSignInOpen(true),
-    [],
   );
 
   const transitionDirection =
@@ -163,7 +153,7 @@ export function WelcomeSetup({
                 >
                   <button
                     data-testid="community-choice-create"
-                    onClick={beginHostedCommunity}
+                    onClick={() => showPage("create")}
                     type="button"
                   >
                     Create a community
@@ -207,7 +197,7 @@ export function WelcomeSetup({
                 >
                   <button
                     data-testid="existing-choice-owner"
-                    onClick={beginHostedCommunity}
+                    onClick={() => showPage("member")}
                     type="button"
                   >
                     I own the community
@@ -228,13 +218,32 @@ export function WelcomeSetup({
                 </Card>
               </div>
             </OnboardingSlideTransition>
-          ) : page === "owned" ? (
+          ) : page === "create" ? (
             <OnboardingSlideTransition
-              className="flex w-full flex-col items-center text-center"
+              className="flex min-h-[calc(100dvh-15.625rem)] w-full flex-col items-center text-center"
               direction={transitionDirection}
-              transitionKey={`owned-${transitionDirection}`}
+              transitionKey={`create-${transitionDirection}`}
             >
-              <HostedCommunityOnboarding onBack={() => showPage("welcome")} />
+              <div className="w-full max-w-[620px]">
+                <h1 className="text-title font-normal">Create a community</h1>
+                <p className="mt-3 text-sm leading-6 text-foreground/80">
+                  A Buzz community is a relay you run yourself — your identity
+                  and your data stay on your keys. Deploy the relay (Docker
+                  image or Helm chart, see the Buzz repository), then connect to
+                  it here as the owner.
+                </p>
+              </div>
+              <div className="flex w-full flex-1 flex-col items-center justify-center gap-16">
+                <InviteRedeemForm
+                  error={null}
+                  isRedeeming={false}
+                  onCancel={() => showPage("welcome")}
+                  onConnect={startConnection}
+                  onRedeem={redeemInvite}
+                  placeholder="Your community relay URL"
+                  variant="onboarding-spotlight"
+                />
+              </div>
             </OnboardingSlideTransition>
           ) : (
             <OnboardingSlideTransition
@@ -315,16 +324,6 @@ export function WelcomeSetup({
               </div>
             </OnboardingSlideTransition>
           )}
-          {isHostedSignInOpen && page !== "owned" ? (
-            <HostedCommunityOnboarding
-              onBack={() => setIsHostedSignInOpen(false)}
-              onReady={() => {
-                setIsHostedSignInOpen(false);
-                showPage("owned");
-              }}
-              stageHidden
-            />
-          ) : null}
         </div>
       </OnboardingFooterProvider>
     </div>

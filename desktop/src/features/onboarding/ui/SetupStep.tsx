@@ -3,14 +3,12 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { Check, Info } from "lucide-react";
 
 import {
-  useAcpAuthMethodsQuery,
   useAcpRuntimesQueryForced,
-  useConnectAcpRuntimeMutation,
   useInstallAcpRuntimeMutation,
 } from "@/features/agents/hooks";
 import { useInstallOutputLine } from "@/features/agents/lib/useInstallOutputLine";
 import { describeResolvedCommand } from "@/features/agents/ui/agentUi";
-import type { AcpAuthMethod, AcpRuntimeCatalogEntry } from "@/shared/api/types";
+import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 import { getInstallErrorMessage } from "@/shared/lib/installError";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
@@ -103,104 +101,35 @@ function RuntimeStatus({
   onInstall: () => void;
   runtime: AcpRuntimeCatalogEntry;
 }) {
-  const methodsQuery = useAcpAuthMethodsQuery(runtime.id, {
-    enabled:
-      runtime.availability === "available" &&
-      runtime.authStatus.status === "logged_out",
-  });
-  const connectMutation = useConnectAcpRuntimeMutation();
   // Child rows share the surface owner's forced query state + refresh callback
   // (`useSetupStepState` owns the single force-on-mount). Each row must not
   // mount its own force effect, or onboarding entry re-runs discovery once per
   // row instead of once for the surface.
   const runtimesQuery = useAcpRuntimesQueryForced({ forceOnMount: false });
-  const [isWaitingForSignIn, setIsWaitingForSignIn] = React.useState(false);
-  const [didSignInCheckTimeOut, setDidSignInCheckTimeOut] =
-    React.useState(false);
-  const isReady = runtimeIsReadyForOnboarding(runtime);
-
-  React.useEffect(() => {
-    if (!isWaitingForSignIn || !isReady) return;
-    setIsWaitingForSignIn(false);
-    setDidSignInCheckTimeOut(false);
-  }, [isReady, isWaitingForSignIn]);
-
-  React.useEffect(() => {
-    if (!isWaitingForSignIn) return;
-
-    const interval = window.setInterval(() => {
-      void runtimesQuery.forceRefresh();
-    }, 2_000);
-    const timeout = window.setTimeout(() => {
-      setIsWaitingForSignIn(false);
-      setDidSignInCheckTimeOut(true);
-    }, 120_000);
-
-    return () => {
-      window.clearInterval(interval);
-      window.clearTimeout(timeout);
-    };
-  }, [isWaitingForSignIn, runtimesQuery.forceRefresh]);
-  const authMethods = getOnboardingAuthMethods(
-    runtime,
-    methodsQuery.data?.methods ?? [],
-  );
-  const authMethod = authMethods[0] ?? null;
-  const shouldSignIn =
+  const isSignedOut =
     runtime.availability === "available" &&
     runtime.authStatus.status === "logged_out";
 
-  if (shouldSignIn) {
+  if (isSignedOut) {
+    // Buzz never drives an external sign-in. If this runtime's own CLI is
+    // already authenticated (the user ran e.g. `claude login` themselves in a
+    // terminal), detection will flip it to READY on the next check.
     return (
       <div className="flex flex-col items-center gap-1.5">
         <Button
-          aria-label={`Sign in to ${runtime.label}`}
+          aria-label={`Check ${runtime.label} again`}
           className="buzz-onboarding-runtime-setup h-5 rounded-full bg-[var(--buzz-welcome-chartreuse)]/30 px-2.5 font-mono !text-badge font-normal uppercase text-foreground hover:bg-[var(--buzz-welcome-chartreuse)]/40"
-          data-testid={`onboarding-runtime-instructions-${runtime.id}`}
-          onClick={() => {
-            if (didSignInCheckTimeOut) {
-              setDidSignInCheckTimeOut(false);
-              setIsWaitingForSignIn(true);
-              void runtimesQuery.forceRefresh();
-              return;
-            }
-            if (!authMethod) {
-              void methodsQuery.refetch();
-              return;
-            }
-            connectMutation.mutate(
-              {
-                methodId: authMethod.id,
-                runtimeId: runtime.id,
-              },
-              {
-                onSuccess: () => setIsWaitingForSignIn(true),
-              },
-            );
-          }}
+          data-testid={`onboarding-runtime-check-again-${runtime.id}`}
+          disabled={runtimesQuery.isFetching}
+          onClick={() => void runtimesQuery.forceRefresh()}
           type="button"
           variant="ghost"
         >
-          {isWaitingForSignIn
-            ? "CHECKING…"
-            : didSignInCheckTimeOut
-              ? "CHECK AGAIN"
-              : "SIGN IN"}
+          {runtimesQuery.isFetching ? "CHECKING…" : "CHECK AGAIN"}
         </Button>
-        {methodsQuery.error instanceof Error ? (
-          <RuntimeErrorTooltip
-            className="absolute inset-x-3 bottom-2 truncate text-xs leading-4 text-destructive"
-            detail="Couldn’t load sign-in options."
-            label="Sign-in unavailable"
-          />
-        ) : null}
-        {connectMutation.error instanceof Error ? (
-          <RuntimeErrorTooltip
-            className="absolute inset-x-3 bottom-2 truncate text-xs leading-4 text-destructive"
-            detail="Couldn’t start sign-in. Try again."
-            label="Sign-in failed"
-          />
-        ) : null}
+        <p className="max-w-[13rem] text-2xs leading-4 text-muted-foreground">
+          Signed out — sign in with its own CLI, then check again.
+        </p>
       </div>
     );
   }
@@ -432,53 +361,6 @@ function runtimeDetailText(runtime: AcpRuntimeCatalogEntry): string {
   return "";
 }
 
-function isSupportedOnboardingAuthMethod(
-  runtime: AcpRuntimeCatalogEntry,
-  method: AcpAuthMethod,
-) {
-  if (runtime.id !== "codex") return true;
-  return !/api[-_ ]?key/i.test(`${method.id} ${method.name}`);
-}
-
-function isPreferredClaudeAuthMethod(method: AcpAuthMethod) {
-  const haystack = [
-    method.id,
-    method.name,
-    method.description ?? "",
-    method.command.join(" "),
-    method.args.join(" "),
-  ]
-    .join(" ")
-    .toLowerCase();
-  return (
-    haystack.includes("claudeai") ||
-    haystack.includes("claude ai") ||
-    haystack.includes("claude.ai") ||
-    haystack.includes("subscription")
-  );
-}
-
-function getOnboardingAuthMethods(
-  runtime: AcpRuntimeCatalogEntry,
-  methods: AcpAuthMethod[],
-) {
-  const supported = methods.filter((method) =>
-    isSupportedOnboardingAuthMethod(runtime, method),
-  );
-
-  if (runtime.id === "claude") {
-    const preferred =
-      supported.find(isPreferredClaudeAuthMethod) ?? supported[0];
-    return preferred ? [preferred] : [];
-  }
-
-  if (runtime.id === "codex") {
-    return supported.slice(0, 1);
-  }
-
-  return supported;
-}
-
 function RuntimeAuthError({ runtime }: { runtime: AcpRuntimeCatalogEntry }) {
   if (runtime.authStatus.status === "config_invalid") {
     return (
@@ -661,8 +543,9 @@ function RuntimeProvidersSection({
           Set up your agent harnesses
         </h1>
         <p className="mx-auto mt-3 max-w-[760px] text-sm leading-6 text-foreground/90">
-          Buzz checks for command-line harnesses on this machine. Install the
-          CLI or sign in to at least one to continue.
+          Agent harnesses are optional — Buzz works without any external
+          accounts. Install one here to run agents on this machine, or continue
+          and add agents later in Settings.
         </p>
       </div>
 
@@ -685,8 +568,8 @@ function RuntimeProvidersSection({
             className="max-w-[560px] rounded-2xl bg-white/70 px-6 py-6 text-sm text-muted-foreground"
             data-testid="onboarding-acp-empty"
           >
-            No supported command-line harnesses were detected yet. Install a
-            supported CLI, then check again.
+            No agent harnesses detected on this machine. You can continue
+            without one and add agents later in Settings.
           </p>
         )}
 

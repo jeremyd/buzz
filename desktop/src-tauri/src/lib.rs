@@ -3,7 +3,6 @@ mod app_menu;
 mod app_state;
 mod archive;
 mod build_identity;
-mod builderlab;
 mod channel_head_cache;
 mod commands;
 mod deep_link;
@@ -54,7 +53,6 @@ mod util;
 #[cfg(target_os = "linux")]
 pub mod webkit_rendering;
 use app_state::{build_app_state, resolve_persisted_identity, AppState};
-use builderlab::*;
 #[doc(hidden)]
 pub use commands::print_agent_access_owner_only_probe_if_requested;
 use commands::*;
@@ -226,8 +224,6 @@ pub fn run() {
         .manage(PendingCommunityDeepLinks::default())
         .manage(PendingNavigationDeepLinks::default())
         .manage(PendingEntityDeepLinks::default())
-        .manage(BuilderlabSession::default())
-        .manage(BuilderlabLogin::default())
         .manage(commands::pairing::PairingHandle::new())
         .manage(terminal_runtime::TerminalSessions::default())
         .manage(archive::sync::ArchiveSyncState::default())
@@ -537,19 +533,6 @@ pub fn run() {
             clear_pending_navigation_deep_links,
             take_pending_entity_deep_link,
             acknowledge_pending_entity_deep_link,
-            start_builderlab_login,
-            cancel_builderlab_login,
-            get_builderlab_auth,
-            clear_builderlab_auth,
-            get_builderlab_nostr_identity,
-            bind_builderlab_nostr_identity,
-            delete_builderlab_nostr_identity,
-            list_builderlab_communities,
-            check_builderlab_community_name,
-            create_builderlab_community,
-            archive_builderlab_community,
-            unarchive_builderlab_community,
-            transfer_builderlab_community,
             title_bar_double_click,
             get_identity,
             get_nsec,
@@ -600,13 +583,11 @@ pub fn run() {
             get_relay_http_url,
             get_media_proxy_port,
             fetch_link_preview_metadata,
-            discover_acp_auth_methods,
             discover_acp_providers,
             discover_git_bash_prerequisite,
             install_acp_runtime,
             save_custom_harness,
             delete_custom_harness,
-            connect_acp_runtime,
             discover_managed_agent_prereqs,
             sign_event,
             sign_nostr_identity_binding,

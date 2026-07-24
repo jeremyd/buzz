@@ -215,106 +215,32 @@ test("unknown authentication can be checked again", async ({ page }) => {
   );
 });
 
-test("auth discovery failure stays actionable without exposing internals", async ({
-  page,
-}) => {
-  await installMockBridge(
-    page,
-    {
-      acpRuntimesCatalog: [
-        runtime("claude", "available", { status: "logged_out" }),
-      ],
-      acpAuthMethodsError: "sensitive auth discovery details",
-    },
-    { skipCommunitySeed: true, skipOnboardingSeed: true },
-  );
-  await page.goto("/");
-  await navigateToSetupPage(page);
-
-  const card = page.getByTestId("onboarding-runtime-claude");
-  await expect(
-    card.getByRole("status", { name: /Sign-in unavailable/ }),
-  ).toBeVisible();
-  await expect(
-    card.getByTestId("onboarding-runtime-instructions-claude"),
-  ).toHaveText("SIGN IN");
-  await expect(card).not.toContainText("sensitive auth discovery details");
-});
-
-test("terminal launch failure keeps Sign in available", async ({ page }) => {
-  await installMockBridge(
-    page,
-    {
-      acpRuntimesCatalog: [
-        runtime("claude", "available", { status: "logged_out" }),
-      ],
-      acpAuthMethods: {
-        claude: {
-          methods: [
-            {
-              id: "subscription",
-              name: "Claude.ai subscription",
-              description: null,
-              type: "terminal",
-            },
-          ],
-        },
-      },
-      connectAcpRuntimeError: "sensitive launch details",
-    },
-    { skipCommunitySeed: true, skipOnboardingSeed: true },
-  );
-  await page.goto("/");
-  await navigateToSetupPage(page);
-
-  const card = page.getByTestId("onboarding-runtime-claude");
-  const signIn = card.getByRole("button", { name: "Sign in to Claude Code" });
-  await signIn.click();
-  await expect(
-    card.getByRole("status", { name: /Sign-in failed/ }),
-  ).toBeVisible();
-  await expect(signIn).toHaveText("SIGN IN");
-  await expect(card).not.toContainText("sensitive launch details");
-});
-
-test("sign in stays pending until catalog detection confirms Ready", async ({
+test("signed-out runtime shows CLI hint and flips to Ready on re-check", async ({
   page,
 }) => {
   const loggedOut = runtime("claude", "available", { status: "logged_out" });
   const loggedIn = runtime("claude", "available", { status: "logged_in" });
   await installMockBridge(
     page,
-    {
-      acpRuntimesCatalogSequence: [[loggedOut], [loggedOut], [loggedIn]],
-      acpAuthMethods: {
-        claude: {
-          methods: [
-            {
-              id: "subscription",
-              name: "Claude.ai subscription",
-              description: null,
-              type: "terminal",
-            },
-          ],
-        },
-      },
-    },
+    { acpRuntimesCatalogSequence: [[loggedOut], [loggedIn]] },
     { skipCommunitySeed: true, skipOnboardingSeed: true },
   );
   await page.goto("/");
   await navigateToSetupPage(page);
 
-  const signIn = page.getByRole("button", { name: "Sign in to Claude Code" });
-  await expect(signIn).toHaveText("SIGN IN");
-  await expect(page.getByTestId("onboarding-setup-next")).toBeDisabled();
-  await signIn.click();
-  await expect(signIn).toHaveText("CHECKING…");
-  await expect(page.getByTestId("onboarding-setup-next")).toBeDisabled();
+  const card = page.getByTestId("onboarding-runtime-claude");
+  await expect(card).toContainText(
+    "Signed out — sign in with its own CLI, then check again.",
+  );
+  // Provider-free completion is always available; a signed-out runtime never
+  // blocks onboarding.
+  await expect(page.getByTestId("onboarding-setup-next")).toBeEnabled();
+  const checkAgain = page.getByTestId("onboarding-runtime-check-again-claude");
+  await expect(checkAgain).toHaveText("CHECK AGAIN");
+  await checkAgain.click();
   await expect(page.getByTestId("onboarding-runtime-ready-claude")).toHaveText(
     "READY",
-    { timeout: 5_000 },
   );
-  await expect(page.getByTestId("onboarding-setup-next")).toBeEnabled();
 });
 
 test("failed install can be retried without shifting card content", async ({
@@ -384,7 +310,9 @@ test("failed install can be retried without shifting card content", async ({
   );
 });
 
-test("install transitions through Sign in to Ready", async ({ page }) => {
+test("install lands in signed-out state, then Ready after re-check", async ({
+  page,
+}) => {
   const notInstalled = runtime("claude", "adapter_missing", {
     status: "unknown",
   });
@@ -396,18 +324,6 @@ test("install transitions through Sign in to Ready", async ({ page }) => {
       acpRuntimesCatalog: [notInstalled],
       acpRuntimesCatalogAfterInstallSequence: [[loggedOut], [loggedIn]],
       installAcpRuntimeDelayMs: 500,
-      acpAuthMethods: {
-        claude: {
-          methods: [
-            {
-              id: "subscription",
-              name: "Claude.ai subscription",
-              description: null,
-              type: "terminal",
-            },
-          ],
-        },
-      },
     },
     { skipCommunitySeed: true, skipOnboardingSeed: true },
   );
@@ -418,10 +334,10 @@ test("install transitions through Sign in to Ready", async ({ page }) => {
   await expect(install).toHaveText("INSTALL");
   await install.click();
 
-  const signIn = page.getByRole("button", { name: "Sign in to Claude Code" });
-  await expect(signIn).toHaveText("SIGN IN");
-  await expect(page.getByTestId("onboarding-setup-next")).toBeDisabled();
-  await signIn.click();
+  const checkAgain = page.getByTestId("onboarding-runtime-check-again-claude");
+  await expect(checkAgain).toHaveText("CHECK AGAIN");
+  await expect(page.getByTestId("onboarding-setup-next")).toBeEnabled();
+  await checkAgain.click();
   await expect(page.getByTestId("onboarding-runtime-ready-claude")).toHaveText(
     "READY",
     { timeout: 5_000 },
