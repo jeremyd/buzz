@@ -1,0 +1,47 @@
+# Maintainer: cloudfodder <cloudfodder@relay.tools>
+#
+# Built by the arch-pkg CI job from the buzz-desktop-linux binary tarball —
+# not from source. @PKGVER@, @VERSION@ and @SHA256@ are substituted by CI
+# before makepkg runs (see .gitlab-ci.yml); the icons and .desktop file are
+# staged next to this PKGBUILD from the repo checkout.
+pkgname=buzz
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="Nostr-based messaging platform for human-agent collaboration (desktop app, CLI, and agent harness)"
+arch=('x86_64')
+url="https://code.relay.tools/forks/buzz"
+license=('Apache-2.0')
+# From readelf NEEDED of the shipped binaries: the desktop app links
+# webkit2gtk-4.1, gtk3 and alsa; the CLI tools only need glibc.
+depends=('webkit2gtk-4.1' 'gtk3' 'alsa-lib' 'gcc-libs' 'glibc')
+# Binaries arrive pre-stripped from the release build.
+options=('!strip' '!debug')
+source=("buzz-@VERSION@-linux-x86_64.tar.gz"
+        'buzz-desktop.desktop'
+        'icon-32x32.png'
+        'icon-64x64.png'
+        'icon-128x128.png'
+        'icon-256x256.png'
+        'icon-512x512.png')
+sha256sums=('@SHA256@'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP'
+            'SKIP')
+
+package() {
+  cd "buzz-@VERSION@-linux-x86_64"
+  local bin
+  for bin in buzz-desktop buzz buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr; do
+    install -Dm755 "$bin" "$pkgdir/usr/bin/$bin"
+  done
+  install -Dm644 "$srcdir/buzz-desktop.desktop" \
+    "$pkgdir/usr/share/applications/buzz-desktop.desktop"
+  local size
+  for size in 32x32 64x64 128x128 256x256 512x512; do
+    install -Dm644 "$srcdir/icon-$size.png" \
+      "$pkgdir/usr/share/icons/hicolor/$size/apps/buzz-desktop.png"
+  done
+}

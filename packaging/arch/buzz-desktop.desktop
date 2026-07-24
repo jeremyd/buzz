@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Buzz
+Comment=Nostr-based messaging for human-agent collaboration
+Exec=buzz-desktop
+Icon=buzz-desktop
+Terminal=false
+Categories=Network;InstantMessaging;
+StartupWMClass=Buzz

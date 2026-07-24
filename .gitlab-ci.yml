@@ -1,8 +1,9 @@
 # GitLab CI for the relay.tools fork — builds distributable artifacts.
 #
-# Scope (first iteration): Linux desktop bundles (deb + AppImage) and the
-# signed Android APK. macOS/Windows/iOS need platform runners this instance
-# doesn't have; docker images are deliberately out of scope for now.
+# Scope (first iteration): Linux desktop bundles (deb + AppImage + binary
+# tarball + Arch package) and the signed Android APK. macOS/Windows/iOS need
+# platform runners this instance doesn't have; docker images are deliberately
+# out of scope for now.
 #
 # Recipes are ported from .github/workflows/release.yml (release-linux job).
 # Builds are unsigned on the Tauri-updater side (no TAURI_SIGNING_PRIVATE_KEY
@@ -102,6 +103,52 @@ desktop-linux:
         echo
       done
       echo "Published under Deploy → Package registry → buzz-desktop-linux ${VERSION}"
+
+# Repackages the binary tarball desktop-linux published into a pacman package
+# (packaging/arch/PKGBUILD). Deliberately touches no Arch mirrors: everything
+# makepkg needs ships in the base-devel image, the binaries come from our own
+# registry, and the icons + .desktop file come from the repo checkout.
+arch-pkg:
+  stage: build
+  image: archlinux:base-devel
+  timeout: 30m
+  needs: ["desktop-linux"]
+  script:
+    - |
+      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      # pacman versions cannot contain hyphens.
+      PKGVER="$(printf '%s' "$VERSION" | tr - _)"
+      TARBALL="buzz-${VERSION}-linux-x86_64.tar.gz"
+      BUILD=/tmp/archbuild
+      mkdir -p "$BUILD"
+      sed -e "s/@PKGVER@/${PKGVER}/g" -e "s/@VERSION@/${VERSION}/g" \
+        packaging/arch/PKGBUILD > "$BUILD/PKGBUILD"
+      cp packaging/arch/buzz-desktop.desktop "$BUILD/"
+      for s in 32x32 64x64 128x128; do
+        cp "desktop/src-tauri/icons/${s}.png" "$BUILD/icon-${s}.png"
+      done
+      cp "desktop/src-tauri/icons/128x128@2x.png" "$BUILD/icon-256x256.png"
+      cp desktop/src-tauri/icons/icon.png "$BUILD/icon-512x512.png"
+      curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" -o "$BUILD/$TARBALL" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-linux/${VERSION}/${TARBALL}"
+      SUM=$(sha256sum "$BUILD/$TARBALL" | cut -d' ' -f1)
+      sed -i "s/@SHA256@/${SUM}/" "$BUILD/PKGBUILD"
+    # makepkg refuses to run as root; --nodeps because the depends are
+    # runtime-only (we repackage prebuilt binaries) and installing them
+    # would need Arch mirrors, which this job deliberately avoids.
+    - useradd -m builder && chown -R builder /tmp/archbuild
+    - su builder -c "cd /tmp/archbuild && makepkg --noconfirm --nodeps"
+    - |
+      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      PKGFILE=$(find /tmp/archbuild -maxdepth 1 -name 'buzz-*.pkg.tar.zst' | head -1)
+      [ -n "$PKGFILE" ] || { echo "No package produced"; exit 1; }
+      NAME=$(basename "$PKGFILE")
+      sha256sum "$PKGFILE"
+      URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-linux/${VERSION}/${NAME}"
+      echo "Uploading ${NAME} -> ${URL}"
+      curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$PKGFILE" "$URL"
+      echo
+      echo "Install with: sudo pacman -U ${NAME}"
 
 android-apk:
   stage: build
