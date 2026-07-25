@@ -36,6 +36,11 @@ before(() => {
   dom.window.__TAURI_INTERNALS__ = {
     invoke: (command) => {
       tauriInvocations.push(command);
+      if (command === "get_presence") {
+        // Read-only probe from the duplicate-start presence gate; these
+        // tests model no externally live runtime, so everyone is offline.
+        return Promise.resolve({});
+      }
       return Promise.reject(new Error(`unexpected Tauri command: ${command}`));
     },
     transformCallback: () => 1,
@@ -104,8 +109,8 @@ test("a stopped member agent is queued for a post-publish wake, never fired", as
   );
   assert.deepEqual(
     tauriInvocations,
-    [],
-    "the readiness pass must not start the agent (or touch the backend)",
+    ["get_presence"],
+    "the readiness pass may only read presence — it must not start the agent (or write to the backend)",
   );
   rendered.unmount();
 });
@@ -171,8 +176,8 @@ test("a non-member agent's wake queues through the attach seam instead of firing
   assert.ok(result.agentsToWake[0].replayFloorUnix > 0);
   assert.deepEqual(
     tauriInvocations,
-    [],
-    "no start may fire while the send is still preparing",
+    ["get_presence"],
+    "no start may fire while the send is still preparing — only the presence read",
   );
   rendered.unmount();
 });

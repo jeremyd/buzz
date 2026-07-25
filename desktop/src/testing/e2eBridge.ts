@@ -305,6 +305,8 @@ type E2eConfig = {
     relayAgentRevalidationRevokedPubkeys?: string[];
     /** Native-like huddle state seeded from authoritative role-bearing membership. */
     huddle?: MockHuddleSeed;
+    /** Current presence by pubkey for mention/lifecycle single-writer tests. */
+    presence?: Record<string, PresenceStatus>;
     agentListDelayMs?: number;
     agentMemory?: RawAgentMemoryListing | Record<string, RawAgentMemoryListing>;
     addChannelMembersDelayMs?: number;
@@ -11280,6 +11282,9 @@ export function maybeInstallE2eTauriMocks() {
   resetMockRelayMembers(config);
   resetMockRelayAgents(config);
   resetMockManagedAgents(config);
+  for (const [pubkey, status] of Object.entries(config.mock?.presence ?? {})) {
+    setMockPresenceStatus(pubkey, status);
+  }
   resetMockPersonas(config);
   resetMockTeams(config);
   seedMockSearchProfiles(config);

@@ -245,6 +245,8 @@ type MockBridgeOptions = {
   relayAgents?: MockRelayAgentSeed[];
   /** Reject successive relay-agent directory reads, then resume. */
   relayAgentListErrors?: (string | null)[];
+  /** Current presence by pubkey for mention/lifecycle single-writer tests. */
+  presence?: Record<string, "online" | "away" | "offline">;
   /** Delay both managed and relay agent directory reads. */
   agentListDelayMs?: number;
   createManagedAgentDelayMs?: number;

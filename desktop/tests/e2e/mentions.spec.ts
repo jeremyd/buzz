@@ -3434,6 +3434,48 @@ test("a deploy held across an A→B→A community round-trip is not fired twice"
     .toBe(baselineStartCount + 2);
 });
 
+test("mentioning an externally live agent does not start its stopped local record", async ({
+  page,
+}) => {
+  await installMockBridge(page, {
+    managedAgents: [
+      {
+        pubkey: IN_CHANNEL_MANAGED_AGENT_PUBKEY,
+        name: "fizz",
+        status: "stopped",
+        channelNames: ["general"],
+      },
+    ],
+    presence: {
+      [IN_CHANNEL_MANAGED_AGENT_PUBKEY]: "online",
+    },
+  });
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const input = page.getByTestId("message-input");
+  await input.fill("Hey @fizz");
+  await expect(autocomplete(page).getByText("fizz")).toBeVisible();
+  await input.press("Enter");
+  await page.keyboard.type(" use the remote runtime");
+
+  const baselineStartCount = commandCount(
+    await readCommandLog(page),
+    "start_managed_agent",
+  );
+  await page.getByTestId("send-message").click();
+
+  const mentionChip = page
+    .getByTestId("message-row")
+    .last()
+    .locator("[data-mention].agent-mention-highlight", { hasText: "fizz" });
+  await expect(mentionChip).toBeVisible();
+  expect(
+    commandCount(await readCommandLog(page), "start_managed_agent"),
+  ).toEqual(baselineStartCount);
+});
+
 test("mentioning an in-channel provider managed agent publishes first and deploys it detached", async ({
   page,
 }) => {
