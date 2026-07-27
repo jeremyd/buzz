@@ -50,6 +50,7 @@ pub mod pairing;
 mod personas;
 mod prevent_sleep;
 mod profile;
+pub(crate) mod profile_fanout;
 mod project_git;
 mod project_git_branches;
 mod project_git_diff;
@@ -112,6 +113,9 @@ pub use pairing::*;
 pub use personas::*;
 pub use prevent_sleep::*;
 pub use profile::*;
+pub(crate) use profile_fanout::{
+    live_pair_relay_urls, profile_fanout_relays, push_profile_fanout_rows, ProfileSyncRow,
+};
 pub use project_git::*;
 pub use project_git_branches::*;
 pub use project_git_diff::*;

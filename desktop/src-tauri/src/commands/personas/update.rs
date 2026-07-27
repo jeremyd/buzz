@@ -112,15 +112,8 @@ fn prepare_linked_profile_update(
 }
 
 /// Profile sync params collected under the store lock for async relay publish:
-/// (agent keys, relay url, display name, avatar url, kind:0 about, auth tag).
-type ProfileSyncParams = Vec<(
-    nostr::Keys,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-)>;
+/// one row per fan-out relay per record (see `crate::commands::ProfileSyncRow`).
+type ProfileSyncParams = Vec<crate::commands::ProfileSyncRow>;
 
 #[tauri::command]
 pub async fn update_persona(
@@ -288,20 +281,14 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
 
                     agents_modified = agents_modified || update.record_changed;
                     if update.profile_sync_required {
-                        if let Ok(agent_keys) = nostr::Keys::parse(&record.private_key_nsec) {
-                            let relay_url = crate::relay::effective_agent_relay_url(
-                                &record.relay_url,
-                                &workspace_relay,
-                            );
-                            params.push((
-                                agent_keys,
-                                relay_url,
-                                record.name.clone(),
-                                update.profile_avatar,
-                                new_about.clone(),
-                                record.auth_tag.clone(),
-                            ));
-                        }
+                        crate::commands::push_profile_fanout_rows(
+                            &state,
+                            record,
+                            &workspace_relay,
+                            update.profile_avatar,
+                            new_about.clone(),
+                            &mut params,
+                        );
                     }
                 }
 

@@ -337,9 +337,14 @@ pub async fn update_managed_agent(
                 .map_err(|e| format!("failed to parse agent keys: {e}"))?;
             // Re-publish the renamed profile to the agent's effective relay:
             // an explicit per-agent relay wins; empty falls back to workspace.
-            let relay_url = crate::relay::effective_agent_relay_url(
+            // Unpinned agents also fan out to every relay they have a live
+            // pair on — kind:0 profiles are per-relay, so a rename that only
+            // reached the active relay would leave the agent's other member
+            // communities showing the old name.
+            let (relay_url, extra_relays) = super::super::profile_fanout_relays(
                 &record.relay_url,
                 &relay_ws_url_with_override(&state),
+                super::super::live_pair_relay_urls(&runtimes, &record.pubkey),
             );
             let display_name = record.name.clone();
             // Avatar fallback derives from the EFFECTIVE harness (persona-wins),
@@ -356,6 +361,7 @@ pub async fn update_managed_agent(
             Some((
                 agent_keys,
                 relay_url,
+                extra_relays,
                 display_name,
                 avatar_url,
                 about,
@@ -406,7 +412,9 @@ pub async fn update_managed_agent(
     // A rename is committed only when profile sync succeeds; otherwise restore
     // the complete pre-edit record so Desktop and the relay keep one
     // authoritative name.
-    if let Some((agent_keys, relay_url, display_name, avatar_url, about, auth_tag)) = sync_params {
+    if let Some((agent_keys, relay_url, extra_relays, display_name, avatar_url, about, auth_tag)) =
+        sync_params
+    {
         if let Err(sync_error) = sync_managed_agent_profile(
             &state,
             &relay_url,
@@ -447,6 +455,28 @@ pub async fn update_managed_agent(
             return Err(format!(
                 "Agent rename failed because its relay profile could not be updated. {rollback_message}: {sync_error}.{restart_suffix}"
             ));
+        }
+        // Best-effort fan-out to the agent's other live-pair relays (unpinned
+        // records only — pinned fan-out is empty). A failure here is not a
+        // rename failure: the per-pair spawn-refresh heals that relay on the
+        // pair's next start.
+        for extra_relay in extra_relays {
+            if let Err(e) = sync_managed_agent_profile(
+                &state,
+                &extra_relay,
+                &agent_keys,
+                &display_name,
+                avatar_url.as_deref(),
+                about.as_deref(),
+                auth_tag.as_deref(),
+            )
+            .await
+            {
+                eprintln!(
+                    "buzz-desktop: profile fan-out to {extra_relay} failed after rename of {}: {e}",
+                    summary.pubkey
+                );
+            }
         }
     }
 

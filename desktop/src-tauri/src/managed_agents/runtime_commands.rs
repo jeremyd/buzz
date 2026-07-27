@@ -309,9 +309,45 @@ fn start_pair(
     record.last_error = None;
     runtimes.insert(key.clone(), ManagedAgentPairRuntime::starting(process));
     let status = status_for(&app, record, &key, runtimes.get(&key), None);
+    // Snapshot per-pair profile reconcile data while the record is still
+    // borrowed. A pair spawn is the moment the agent joins its community's
+    // relay, so the reconcile targets the PAIR's relay: the record-level
+    // reconcile in start_managed_agent/restore only ever reaches the record's
+    // effective relay, which for unpinned agents is the active workspace — a
+    // pair spawned on any other community relay (#2122 startup fan-out,
+    // mention wake, sidebar start) would otherwise never get a kind:0 there,
+    // and locally-renamed agents would keep stale names on that relay forever.
+    let reconcile_data = state
+        .managed_agent_profile_reconcile_enabled()
+        .load(Ordering::Acquire)
+        .then(|| {
+            let personas = load_personas(&app).unwrap_or_default();
+            crate::commands::ProfileReconcileData {
+                // Pin the PAIR's relay: the deferred task must not resolve a
+                // post-switch workspace (see resolve_reconcile_relay).
+                target_relay_url: Some(key.relay_url.clone()),
+                ..crate::commands::profile_reconcile_data(record, &personas)
+            }
+        });
     drop(runtimes);
     save_managed_agents(&app, &records)?;
     emit_status(&app, &status);
+    if let Some(data) = reconcile_data {
+        let pubkey = data.pubkey.clone();
+        let pair_relay = data.relay_url.clone();
+        let reconcile_app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let state = reconcile_app.state::<AppState>();
+            if let Err(e) =
+                crate::commands::reconcile_agent_profile(&state, &reconcile_app, &pubkey, &data)
+                    .await
+            {
+                eprintln!(
+                    "buzz-desktop: pair profile reconciliation failed for agent {pubkey} on {pair_relay}: {e}"
+                );
+            }
+        });
+    }
     Ok(status)
 }
 
