@@ -14,6 +14,7 @@ import remarkCustomEmoji, {
   type CustomEmoji,
 } from "@/shared/lib/remarkCustomEmoji";
 import remarkMentions from "@/shared/lib/remarkMentions";
+import remarkNostrMentions from "@/shared/lib/remarkNostrMentions";
 import remarkSpoilers from "@/shared/lib/remarkSpoilers";
 
 import { buzzDeepLinkUrlTransform } from "./utils";
@@ -112,6 +113,7 @@ function buildMarkdownElement(input: MarkdownParseInputs): React.ReactElement {
       remarkMessageLinks,
       remarkEntityLinks,
       [remarkMentions, { mentionNames: input.mentionNames }],
+      remarkNostrMentions,
       [remarkChannelLinks, { channelNames: input.channelNames }],
       [remarkCustomEmoji, { customEmoji: input.customEmoji }],
       // biome-ignore lint/suspicious/noExplicitAny: PluggableList type not directly importable

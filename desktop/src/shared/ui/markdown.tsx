@@ -111,6 +111,7 @@ import {
 import { MarkdownTable } from "./markdown/MarkdownTable";
 import { ProgressiveImage } from "./markdown/ProgressiveImage";
 import { MessageLinkPill } from "./markdown/MessageLinkPill";
+import { NostrMentionChip } from "./markdown/NostrMentionChip";
 import { renderCachedMarkdown } from "./markdown/nodeCache";
 import { useMessageLinkPreviews } from "./markdown/useMessageLinkPreviews";
 import {
@@ -1578,6 +1579,13 @@ export function createMarkdownComponents(
     mention: ({ children }: { children?: React.ReactNode }) => (
       <MarkdownMention interactive={interactive}>{children}</MarkdownMention>
     ),
+    "nostr-mention": function MarkdownNostrMention({
+      pubkey,
+    }: {
+      pubkey?: string;
+    }) {
+      return <NostrMentionChip interactive={interactive} pubkey={pubkey} />;
+    },
     emoji: ({ src, alt }: { src?: string; alt?: string }) => {
       const resolvedSrc = src ? rewriteRelayUrl(src) : src;
       if (!resolvedSrc) {
