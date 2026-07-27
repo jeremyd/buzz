@@ -14,6 +14,7 @@ use crate::{
     util::now_iso,
 };
 
+use super::propagation::propagate_persona_respond_to;
 use super::{normalize_description, pending, retain_persona_pending, trim_optional, trim_required};
 
 #[cfg(test)]
@@ -206,7 +207,24 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 crate::managed_agents::validate_user_env_keys(&env_vars)?;
                 persona.env_vars = env_vars;
             }
+            let old_respond_to = persona.respond_to.clone();
+            let old_respond_to_allowlist = persona.respond_to_allowlist.clone();
             apply_persona_behavior(persona, input.behavior)?;
+            // Propagate a respond-to edit to existing instances. A cleared
+            // mode (None) propagates nothing: instances keep their own gate.
+            let respond_to_propagation = if persona.respond_to != old_respond_to
+                || persona.respond_to_allowlist != old_respond_to_allowlist
+            {
+                match persona.respond_to.as_deref() {
+                    Some(mode) => Some((
+                        crate::managed_agents::RespondTo::parse_wire(mode)?,
+                        persona.respond_to_allowlist.clone(),
+                    )),
+                    None => None,
+                }
+            } else {
+                None
+            };
             persona.updated_at = now_iso();
 
             let result = persona.clone();
@@ -215,11 +233,15 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
             let retained = retain(&app, &state, &result)?;
             try_regenerate_nest(&app);
 
-            // If the avatar, display_name, or effective description changed,
-            // propagate to linked agent records and collect relay profile sync
-            // params for the async phase. An about-only change touches no
-            // record bytes but still republishes each linked kind:0 profile.
-            let sync_params: ProfileSyncParams = if avatar_changed || name_changed || about_changed
+            // If the avatar, display_name, effective description, or
+            // respond-to gate changed, propagate to linked agent records and
+            // collect relay profile sync params for the async phase. An
+            // about-only change touches no record bytes but still republishes
+            // each linked kind:0 profile.
+            let sync_params: ProfileSyncParams = if avatar_changed
+                || name_changed
+                || about_changed
+                || respond_to_propagation.is_some()
             {
                 let mut records = load_managed_agents(&app)?;
                 let mut params: ProfileSyncParams = Vec::new();
@@ -240,6 +262,16 @@ pub(super) async fn update_persona_with<R: Send + 'static>(
                 } else {
                     Vec::new()
                 };
+
+                // Respond-to changes touch only the local gate config — they
+                // never trigger a relay profile sync.
+                if let Some((mode, allowlist)) = &respond_to_propagation {
+                    let gated =
+                        propagate_persona_respond_to(&mut records, &result.id, *mode, allowlist);
+                    if !gated.is_empty() {
+                        agents_modified = true;
+                    }
+                }
 
                 for record in records.iter_mut() {
                     if record.persona_id.as_deref() != Some(&result.id) {

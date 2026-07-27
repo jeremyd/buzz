@@ -92,6 +92,8 @@ pub async fn list_personas(app: AppHandle) -> Result<Vec<AgentDefinition>, Strin
     .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }
 
+mod propagation;
+
 #[cfg(test)]
 mod delete_cascade_tests;
 
