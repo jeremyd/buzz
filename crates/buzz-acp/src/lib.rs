@@ -541,14 +541,35 @@ mod inbound_author_gate {
                 )
                 .await;
             if !decision.allowed {
-                tracing::debug!(
-                    channel_id = %buzz_event.channel_id,
-                    raw_author = %buzz_event.event.pubkey.to_hex(),
-                    effective_author = %decision.effective_author,
-                    mode = %respond_to,
-                    is_dm = decision.is_dm,
-                    "inbound author gate — dropping event"
-                );
+                // Every event in a subscribed channel flows through this gate,
+                // so a blanket warn would be noise. But a dropped event that
+                // p-tags THIS agent is someone visibly trying to reach it and
+                // silently getting nothing — that case must be loud (repeated
+                // field reports of "the agent just ignored me").
+                let mentions_me = buzz_event.event.tags.iter().any(|tag| {
+                    let s = tag.as_slice();
+                    s.first().map(|k| k.as_str()) == Some("p")
+                        && s.get(1).map(|v| v.as_str()) == Some(self.agent_pubkey_hex.as_str())
+                });
+                if mentions_me {
+                    tracing::warn!(
+                        channel_id = %buzz_event.channel_id,
+                        raw_author = %buzz_event.event.pubkey.to_hex(),
+                        effective_author = %decision.effective_author,
+                        mode = %respond_to,
+                        is_dm = decision.is_dm,
+                        "inbound author gate — dropping event that mentions this agent (author not admitted by respond-to config)"
+                    );
+                } else {
+                    tracing::debug!(
+                        channel_id = %buzz_event.channel_id,
+                        raw_author = %buzz_event.event.pubkey.to_hex(),
+                        effective_author = %decision.effective_author,
+                        mode = %respond_to,
+                        is_dm = decision.is_dm,
+                        "inbound author gate — dropping event"
+                    );
+                }
                 return None;
             }
             Some(AuthorizedListenerEvent {
