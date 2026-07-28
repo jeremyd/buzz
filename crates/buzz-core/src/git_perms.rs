@@ -423,6 +423,24 @@ pub fn parse_protection_tags(tags: &[Vec<String>]) -> Result<ParsedProtection, R
     })
 }
 
+/// Tag name that marks a kind:30617 repo announcement as publicly readable —
+/// i.e. anonymously cloneable/fetchable with no NIP-98 auth and no channel
+/// membership. Mirrors the channel-visibility `["public"]` tag convention.
+///
+/// Absence of this tag means the repo is private (the default): reads require
+/// an authenticated caller with active membership in the repo's bound channel.
+/// Publicness never affects push, which is always authenticated.
+pub const REPO_PUBLIC_TAG: &str = "public";
+
+/// Returns true if a kind:30617 announcement's tag list marks the repo public.
+///
+/// Matches a first-position `["public"]` tag. Any additional tag values are
+/// ignored so the marker stays forward-compatible.
+pub fn repo_is_public(tags: &[Vec<String>]) -> bool {
+    tags.iter()
+        .any(|tag| tag.first().map(String::as_str) == Some(REPO_PUBLIC_TAG))
+}
+
 /// Built-in default minimum role for an operation when no `buzz-protect` tag matches.
 pub fn default_min_role(ref_name: &str, kind: UpdateKind) -> MemberRole {
     let is_branch = ref_name.starts_with("refs/heads/");
@@ -735,6 +753,27 @@ mod tests {
             UpdateKind::classify("aaa", "bbb", false),
             UpdateKind::NonFastForward
         );
+    }
+
+    #[test]
+    fn repo_is_public_matches_public_tag() {
+        let tags = vec![
+            vec!["d".to_string(), "demo".to_string()],
+            vec!["public".to_string()],
+        ];
+        assert!(repo_is_public(&tags));
+    }
+
+    #[test]
+    fn repo_is_public_false_without_tag() {
+        let tags = vec![
+            vec!["d".to_string(), "demo".to_string()],
+            vec!["buzz-channel".to_string(), "channel-id".to_string()],
+        ];
+        assert!(!repo_is_public(&tags));
+        // A `p` tag must not be mistaken for the `public` marker.
+        let tags = vec![vec!["p".to_string(), "abcd".to_string()]];
+        assert!(!repo_is_public(&tags));
     }
 
     #[test]

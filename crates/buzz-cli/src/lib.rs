@@ -1201,6 +1201,25 @@ pub enum ReposCmd {
         /// the author runs `buzz repos bind` (issue #3527).
         #[arg(long)]
         channel: Option<String>,
+        /// Mark the repo publicly cloneable — anyone can `git clone` it with no
+        /// auth, even from a private channel. Omit for a private repo.
+        #[arg(long)]
+        public: bool,
+    },
+    /// Set a repository's clone visibility (public = anonymously cloneable).
+    ///
+    /// Read-modify-write on the existing kind:30617 announcement — all other
+    /// metadata and protection rules are preserved.
+    SetVisibility {
+        /// Repository identifier (d-tag)
+        #[arg(long)]
+        id: String,
+        /// Make the repo publicly cloneable (no auth required to clone/fetch).
+        #[arg(long, group = "visibility")]
+        public: bool,
+        /// Make the repo private (clone/fetch requires channel membership).
+        #[arg(long, group = "visibility")]
+        private: bool,
     },
     /// Get a repository announcement
     Get {
@@ -2399,7 +2418,7 @@ mod tests {
         );
         assert_eq!(
             names(&cmd, "repos"),
-            vec!["bind", "create", "get", "list", "protect"]
+            vec!["bind", "create", "get", "list", "protect", "set-visibility"]
         );
         let repos = cmd
             .get_subcommands()
@@ -2476,7 +2495,7 @@ mod tests {
             ("pr", 5),
             ("projects", 8),
             ("reactions", 3),
-            ("repos", 5),
+            ("repos", 6),
             ("social", 7),
             ("upload", 1),
             ("users", 5),

@@ -741,6 +741,7 @@ async fn ensure_default_create_repo(
         None,
         &[],
         Some(channel),
+        false,
     )?;
     let event = client.sign_event(builder)?;
     let raw = client.submit_event(event).await?;
@@ -897,6 +898,7 @@ mod tests {
             None,
             &[],
             Some(winning_channel),
+            false,
         )
         .unwrap()
         .sign_with_keys(&keys)

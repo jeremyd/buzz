@@ -217,6 +217,7 @@ pub(crate) fn build_create_announcement(
     web_url: Option<&str>,
     relays: &[String],
     channel: Option<&str>,
+    public: bool,
 ) -> Result<EventBuilder, CliError> {
     validate_repo_id(repo_id)?;
 
@@ -230,6 +231,7 @@ pub(crate) fn build_create_announcement(
         &clone_refs,
         web_url,
         &relay_refs,
+        public,
     )
     .map_err(|e| CliError::Other(format!("build_repo_announcement failed: {e}")))?;
 
@@ -250,6 +252,7 @@ pub async fn cmd_create_repo(
     web_url: Option<&str>,
     relays: &[String],
     channel: Option<&str>,
+    public: bool,
 ) -> Result<(), CliError> {
     let builder = build_create_announcement(
         repo_id,
@@ -259,6 +262,7 @@ pub async fn cmd_create_repo(
         web_url,
         relays,
         channel,
+        public,
     )?;
     let event = client.sign_event(builder)?;
     let owner = event.pubkey.to_hex();
@@ -276,6 +280,45 @@ pub async fn cmd_create_repo(
         .await;
     }
     Ok(())
+}
+
+/// Toggle a repo's clone visibility by adding/removing the `["public"]` tag on
+/// its current kind:30617 announcement, preserving all other metadata and
+/// protection rules. Public = anonymously cloneable; private = channel members
+/// only.
+pub async fn cmd_set_visibility(
+    client: &BuzzClient,
+    repo_id: &str,
+    public: bool,
+) -> Result<(), CliError> {
+    let existing = current_repo(client, repo_id).await?;
+    let canonical_id = repo_id_from_event(&existing)?.to_string();
+
+    // Drop any prior `public` (and stale `auth`) tag, then re-add if requested.
+    let mut tags: Vec<Tag> = existing
+        .tags
+        .iter()
+        .filter(|tag| !has_tag_name(tag, "public") && !has_tag_name(tag, "auth"))
+        .cloned()
+        .collect();
+    if public {
+        tags.push(Tag::parse(["public"]).map_err(tag_error)?);
+    }
+
+    // Advance only the observed head so a delayed writer can't leapfrog an
+    // intervening update and silently erase metadata (mirrors protection edits).
+    let next_created_at = existing
+        .created_at
+        .as_secs()
+        .checked_add(1)
+        .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
+    let builder =
+        buzz_sdk::build_repo_announcement_with_tags(&canonical_id, &existing.content, tags)
+            .map_err(|error| {
+                CliError::Other(format!("failed to build repository update: {error}"))
+            })?
+            .custom_created_at(Timestamp::from(next_created_at));
+    submit_repo_update(client, builder).await
 }
 
 pub async fn cmd_get_repo(
@@ -426,6 +469,7 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
             web,
             relays,
             channel,
+            public,
         } => {
             cmd_create_repo(
                 client,
@@ -436,8 +480,21 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
                 web.as_deref(),
                 &relays,
                 channel.as_deref(),
+                public,
             )
             .await
+        }
+        ReposCmd::SetVisibility {
+            id,
+            public,
+            private,
+        } => {
+            if !public && !private {
+                return Err(CliError::Usage(
+                    "specify exactly one of --public or --private".into(),
+                ));
+            }
+            cmd_set_visibility(client, &id, public).await
         }
         ReposCmd::Get { id, owner } => cmd_get_repo(client, &id, owner.as_deref()).await,
         ReposCmd::List { owner, limit } => cmd_list_repos(client, owner.as_deref(), limit).await,
@@ -782,6 +839,7 @@ mod tests {
             None,
             &[],
             Some(&channel),
+            false,
         )
         .expect("build create announcement")
         .sign_with_keys(&Keys::generate())
@@ -805,7 +863,7 @@ mod tests {
 
     #[test]
     fn create_without_channel_emits_no_binding_tag() {
-        let event = build_create_announcement("demo", None, None, &[], None, &[], None)
+        let event = build_create_announcement("demo", None, None, &[], None, &[], None, false)
             .expect("build create announcement")
             .sign_with_keys(&Keys::generate())
             .expect("sign create announcement");
@@ -821,8 +879,9 @@ mod tests {
 
     #[test]
     fn create_rejects_malformed_channel_uuid() {
-        let error = build_create_announcement("demo", None, None, &[], None, &[], Some("nope"))
-            .expect_err("malformed channel id must not build an announcement");
+        let error =
+            build_create_announcement("demo", None, None, &[], None, &[], Some("nope"), false)
+                .expect_err("malformed channel id must not build an announcement");
         assert!(matches!(error, crate::error::CliError::Usage(_)));
     }
 

@@ -83,137 +83,17 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         parts: &mut axum::http::request::Parts,
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
-        let method = parts.method.as_str();
+        let tenant = bind_git_tenant(parts, state).await?;
+        let (pubkey, auth_tag, signed_auth_created_at) = verify_git_auth(parts, state, &tenant)?;
 
-        let auth_header = parts
-            .headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .ok_or_else(|| {
-                Response::builder()
-                    .status(StatusCode::UNAUTHORIZED)
-                    .header(
-                        "WWW-Authenticate",
-                        format!("Nostr realm=\"buzz\", method=\"{method}\""),
-                    )
-                    .body(Body::from("missing Authorization header"))
-                    .unwrap()
-            })?;
-
-        let token = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header(
-                    "WWW-Authenticate",
-                    format!("Nostr realm=\"buzz\", method=\"{method}\""),
-                )
-                .body(Body::from("expected Authorization: Nostr <base64>"))
-                .unwrap()
-        })?;
-
-        let event_bytes = base64::engine::general_purpose::STANDARD
-            .decode(token)
-            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token))
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid base64").into_response())?;
-        let event_json = String::from_utf8(event_bytes)
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid utf-8").into_response())?;
-
-        // Row zero for Git HTTP: bind the request Host to a server-resolved
-        // tenant before URL verification. We still do not trust forwarded
-        // headers; the signed `u` tag is checked against the host that resolved
-        // through the authoritative communities table, not a deployment-global
-        // `config.relay_url` and not any client-supplied community value.
-        let raw_host = parts
-            .headers
-            .get(header::HOST)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let tenant = crate::tenant::bind_community(&state.db, raw_host)
-            .await
-            .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())?;
-        let expected_url = git_expected_url(
-            &state.config.relay_url,
-            &tenant,
-            parts
-                .uri
-                .path_and_query()
-                .map(|pq| pq.as_str())
-                .unwrap_or(parts.uri.path()),
-        )
-        .ok_or_else(|| (StatusCode::BAD_REQUEST, "unrecognized git endpoint").into_response())?;
-
-        // Repo-root URL verification.
-        //
-        // The credential helper signs a NIP-98 token with:
-        //   u = <repo-root>   (e.g., http://host/git/{owner}/{repo})
-        //
-        // Git's credential protocol does NOT pass query strings to helpers, so
-        // service-scoping (`?service=...`) cannot be implemented at the NIP-98
-        // level without protocol changes. The token is repo-scoped, not service-scoped.
-        //
-        // Security is still provided by:
-        // - ±60s timestamp window (limits replay)
-        // - HTTPS in production (prevents token theft)
-        // - Pre-receive hook for push authorization (role + protection rules)
-        // - Endpoint routing (clone/push are different HTTP paths)
-
-        // Skip HTTP method check for git routes.
-        //
-        // Git's credential helper signs with `method=GET` (the initial /info/refs request)
-        // then reuses the token for POST (pack data). Method binding can't work here.
-        //
-        // Security is provided by: service-binding in the URL (clone vs push scoped),
-        // ±60s timestamp, and the pre-receive hook for push authorization.
-        // We pass the method from the event itself so verify_nip98_event always accepts.
-        let event_method = serde_json::from_str::<serde_json::Value>(&event_json)
-            .ok()
-            .and_then(|v| {
-                v["tags"]
-                    .as_array()?
-                    .iter()
-                    .find(|t| t[0].as_str() == Some("method"))?[1]
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| method.to_owned());
-
-        // SECURITY: method intentionally not verified for git routes. The tautological
-        // check (event.method == event.method) is deliberate — see comment block above.
-        // Git's credential protocol signs once with GET and reuses for POST. The URL tag
-        // provides the real security boundary (±60s timestamp + URL lock + HTTPS).
-
-        // body=None: can't buffer streaming pack data to verify payload hash.
-        // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
-        let pubkey =
-            buzz_auth::nip98::verify_nip98_event(&event_json, &expected_url, &event_method, None)
-                .map_err(|e| {
-                warn!(error = %e, "git NIP-98 auth failed");
-                (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
-            })?;
-
-        // NOTE: NIP-98 event-ID dedup intentionally NOT implemented here.
-        // Git's credential protocol reuses one signed token across multiple requests
-        // in a session (info_refs GET → upload-pack/receive-pack POST). Rejecting
-        // replayed event IDs would break normal clone/push operations.
-        // The ±60s timestamp window + URL scoping + HTTPS transport provide sufficient
-        // replay protection for v1. Per-request signing requires protocol changes.
-
-        let event: nostr::Event = serde_json::from_str(&event_json)
-            .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid auth event").into_response())?;
-        let signed_auth_created_at = event.created_at.as_secs();
-
-        // Relay membership gate (NIP-43). Git cannot carry a standalone
-        // x-auth-tag header through the credential-helper protocol, so agents
-        // attach their NIP-OA attestation to the signed NIP-98 event, matching
-        // the WebSocket NIP-42 flow.
-        let event_auth_tag = crate::handlers::auth::extract_auth_tag_json(&event);
-        let header_auth_tag = crate::api::relay_members::extract_auth_tag_header(&parts.headers);
-        let auth_tag = event_auth_tag.as_deref().or(header_auth_tag);
+        // Relay membership gate (NIP-43). Enforced here for writes
+        // (receive-pack). Reads apply the equivalent gate inside
+        // `authorize_git_read` so a repo marked public can short-circuit it.
         if crate::api::relay_members::enforce_relay_membership(
             state,
             tenant.community(),
             pubkey.as_bytes(),
-            auth_tag,
+            auth_tag.as_deref(),
             Some(signed_auth_created_at),
         )
         .await
@@ -227,7 +107,7 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
             &state.db,
             tenant.community(),
             &pubkey,
-            auth_tag,
+            auth_tag.as_deref(),
             Some(signed_auth_created_at),
         )
         .await?;
@@ -322,6 +202,199 @@ fn enforce_git_ban_cascade(
         Some(owner) => enforce_git_ban(owner),
         None => Ok(()),
     }
+}
+
+/// Optional NIP-98 auth extractor for git *read* routes.
+///
+/// Unlike [`GitAuth`], a missing `Authorization` header yields `pubkey: None`
+/// (anonymous) instead of a 401 — the read handlers allow anonymous clone/fetch
+/// of repos marked public (see [`authorize_git_read`]). A *present* but
+/// malformed token still fails with 401. Relay membership is not enforced here;
+/// the read gate applies it only to authenticated access of a private repo.
+pub struct OptionalGitAuth {
+    /// The authenticated caller's public key, or `None` for an anonymous read.
+    pub pubkey: Option<nostr::PublicKey>,
+    /// NIP-OA auth tag carried by the signed event or `x-auth-tag` header.
+    pub auth_tag: Option<String>,
+    /// Signed auth event `created_at`, for NIP-OA time-bound checks.
+    /// `None` for anonymous reads.
+    pub signed_auth_created_at: Option<u64>,
+    /// Server-resolved tenant bound from the request Host before auth checks.
+    pub tenant: TenantContext,
+}
+
+impl axum::extract::FromRequestParts<Arc<AppState>> for OptionalGitAuth {
+    type Rejection = Response;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &Arc<AppState>,
+    ) -> Result<Self, Self::Rejection> {
+        let tenant = bind_git_tenant(parts, state).await?;
+
+        // No credentials → anonymous. The read handler decides whether the repo
+        // permits anonymous access (public) or requires membership (private).
+        if parts.headers.get(header::AUTHORIZATION).is_none() {
+            return Ok(OptionalGitAuth {
+                pubkey: None,
+                auth_tag: None,
+                signed_auth_created_at: None,
+                tenant,
+            });
+        }
+
+        // Credentials present → verify them; a malformed token still 401s.
+        let (pubkey, auth_tag, signed_auth_created_at) = verify_git_auth(parts, state, &tenant)?;
+        deny_banned_git_principal(
+            &state.db,
+            tenant.community(),
+            &pubkey,
+            auth_tag.as_deref(),
+            Some(signed_auth_created_at),
+        )
+        .await?;
+        Ok(OptionalGitAuth {
+            pubkey: Some(pubkey),
+            auth_tag,
+            signed_auth_created_at: Some(signed_auth_created_at),
+            tenant,
+        })
+    }
+}
+
+/// Bind the request Host to a server-resolved tenant (community) before any
+/// auth work. Forwarded headers are never trusted; the host resolves through
+/// the authoritative communities table. Fail-closed to a generic 404 so callers
+/// cannot probe which communities exist.
+async fn bind_git_tenant(
+    parts: &axum::http::request::Parts,
+    state: &Arc<AppState>,
+) -> Result<TenantContext, Response> {
+    let raw_host = parts
+        .headers
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())
+}
+
+/// Verify the `Authorization: Nostr <base64>` NIP-98 token for a git request,
+/// given an already-bound `tenant`. Returns the caller pubkey, any NIP-OA
+/// auth tag (from the signed event, else the `x-auth-tag` header), and the
+/// signed event's `created_at` for authorization time-bound checks.
+///
+/// Does NOT enforce relay membership — the caller applies the appropriate gate
+/// (writes in the [`GitAuth`] extractor, reads in [`authorize_git_read`]) so a
+/// public repo can bypass it.
+#[allow(clippy::result_large_err)] // Response is the natural error type for axum extractors
+fn verify_git_auth(
+    parts: &axum::http::request::Parts,
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+) -> Result<(nostr::PublicKey, Option<String>, u64), Response> {
+    let method = parts.method.as_str();
+
+    let auth_header = parts
+        .headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| {
+            Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(
+                    "WWW-Authenticate",
+                    format!("Nostr realm=\"buzz\", method=\"{method}\""),
+                )
+                .body(Body::from("missing Authorization header"))
+                .unwrap()
+        })?;
+
+    let token = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(
+                "WWW-Authenticate",
+                format!("Nostr realm=\"buzz\", method=\"{method}\""),
+            )
+            .body(Body::from("expected Authorization: Nostr <base64>"))
+            .unwrap()
+    })?;
+
+    let event_bytes = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token))
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid base64").into_response())?;
+    let event_json = String::from_utf8(event_bytes)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid utf-8").into_response())?;
+
+    // Repo-root URL verification. The credential helper signs a NIP-98 token
+    // with `u = <repo-root>` (e.g. http://host/git/{owner}/{repo}). Git's
+    // credential protocol does not pass query strings to helpers, so the token
+    // is repo-scoped, not service-scoped. Security is provided by the ±60s
+    // timestamp window, HTTPS in production, the pre-receive hook for push
+    // authorization, and endpoint routing (clone vs push are different paths).
+    let expected_url = git_expected_url(
+        &state.config.relay_url,
+        tenant,
+        parts
+            .uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(parts.uri.path()),
+    )
+    .ok_or_else(|| (StatusCode::BAD_REQUEST, "unrecognized git endpoint").into_response())?;
+
+    // Skip HTTP method check for git routes. Git's credential helper signs with
+    // `method=GET` (the initial /info/refs request) then reuses the token for
+    // POST (pack data), so method binding can't work here. We pass the method
+    // from the event itself so `verify_nip98_event` always accepts; the URL tag
+    // is the real security boundary (±60s timestamp + URL lock + HTTPS).
+    let event_method = serde_json::from_str::<serde_json::Value>(&event_json)
+        .ok()
+        .and_then(|v| {
+            v["tags"]
+                .as_array()?
+                .iter()
+                .find(|t| t[0].as_str() == Some("method"))?[1]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| method.to_owned());
+
+    // body=None: can't buffer streaming pack data to verify payload hash.
+    // Token is time-bounded (±60s) and URL-locked — acceptable trade-off.
+    let pubkey =
+        buzz_auth::nip98::verify_nip98_event(&event_json, &expected_url, &event_method, None)
+            .map_err(|e| {
+                warn!(error = %e, "git NIP-98 auth failed");
+                (StatusCode::UNAUTHORIZED, "NIP-98 auth failed").into_response()
+            })?;
+
+    // NIP-98 event-ID dedup intentionally NOT implemented — git reuses one
+    // signed token across the info/refs GET and the upload/receive-pack POST.
+
+    let event: nostr::Event = serde_json::from_str(&event_json)
+        .map_err(|_| (StatusCode::UNAUTHORIZED, "invalid auth event").into_response())?;
+
+    // NIP-OA attestation: agents attach it to the signed event (git can't carry
+    // a standalone x-auth-tag through the credential-helper protocol), with the
+    // header as a fallback for direct callers. The event value wins.
+    let event_auth_tag = crate::handlers::auth::extract_auth_tag_json(&event);
+    let header_auth_tag = parts
+        .headers
+        .get("x-auth-tag")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let auth_tag = event_auth_tag.or(header_auth_tag);
+
+    // Signed-event timestamp for the NIP-OA authorization time-bound checks
+    // (membership + ban gates verify the attestation was valid at signing
+    // time, not merely now).
+    let signed_auth_created_at = event.created_at.as_secs();
+
+    Ok((pubkey, auth_tag, signed_auth_created_at))
 }
 
 /// Construct the repo-root NIP-98 `u` URL expected for a git HTTP request.
@@ -453,29 +526,56 @@ fn hydrate_error_to_response(owner: &str, repo: &str, err: HydrateError) -> Resp
         .into_response()
 }
 
+/// Outcome of [`authorize_git_read`]: how a read was authorized.
+///
+/// The read handler enforces the relay-membership gate only for
+/// [`GitReadAccess::Authenticated`]; a [`GitReadAccess::Public`] repo is
+/// readable by anyone, so it must never trip the membership check.
+#[derive(Debug)]
+enum GitReadAccess {
+    /// Repo is marked public — anonymous clone/fetch is allowed.
+    Public,
+    /// Private repo, authorized via the caller's active channel membership.
+    Authenticated,
+}
+
+/// True if a kind:30617 announcement marks the repo publicly (anonymously)
+/// cloneable via a `["public"]` tag. See
+/// [`buzz_core::git_perms::REPO_PUBLIC_TAG`].
+fn repo_is_public(event: &nostr::Event) -> bool {
+    event.tags.iter().any(|tag| {
+        tag.as_slice().first().map(String::as_str) == Some(buzz_core::git_perms::REPO_PUBLIC_TAG)
+    })
+}
+
 /// SEC-005: authorize a repository *read* (ref advertisement, upload-pack).
 ///
-/// The authorization invariant is the authenticated git caller's **current
-/// active membership in the repo's bound channel**. NIP-98 alone only proves
-/// key possession — without this gate any authenticated pubkey (including a
-/// member removed from the channel) can clone channel-bound repositories.
+/// A repo whose current kind:30617 announcement carries a `["public"]` tag is
+/// readable by anyone — anonymous or authenticated — and returns
+/// [`GitReadAccess::Public`]. Otherwise the authorization invariant is the
+/// authenticated caller's **current active membership in the repo's bound
+/// channel**: NIP-98 alone only proves key possession — without this gate any
+/// authenticated pubkey (including a member removed from the channel) could
+/// clone channel-bound repositories.
 ///
-/// Resolution follows the current authoritative announcement, the same
-/// mapping the push policy endpoint uses:
+/// Resolution follows the current authoritative announcement, the same mapping
+/// the push policy endpoint uses:
 /// 1. current live kind:30617 by `(community, owner pubkey from the URL,
 ///    d = canonical repo name)` — soft-deleted/replaced announcements do not
 ///    resolve;
-/// 2. its `buzz-channel` tag → channel UUID;
-/// 3. [`buzz_db::Db::get_member_role`] for the caller — a read is allowed
-///    only on `Ok(Some(role))` with a role the relay recognizes.
+/// 2. public-tag short-circuit → [`GitReadAccess::Public`];
+/// 3. otherwise its `buzz-channel` tag → channel UUID;
+/// 4. [`buzz_db::Db::get_member_role`] for the caller — a read is allowed only
+///    on `Ok(Some(role))` with a role the relay recognizes.
 ///
-/// Fail-closed: missing/deleted announcement, invalid owner, missing or
-/// malformed `buzz-channel` binding, non-member, unknown role, and every DB
-/// error all deny. There is deliberately **no repo-owner bypass**: an owner
-/// removed from the bound channel loses read access, which is the exact
-/// exploit shape this gate closes. Every denial is the same generic 404 as a
-/// nonexistent repo so membership cannot be probed through the git endpoints
-/// — with exactly one carve-out: a **never-bound** repo read by its own
+/// Fail-closed: missing/deleted announcement, invalid owner, anonymous caller
+/// on a private repo, missing or malformed `buzz-channel` binding, non-member,
+/// unknown role, and every DB error all deny. There is deliberately **no
+/// repo-owner bypass** for private repos: an owner removed from the bound
+/// channel loses read access, which is the exact exploit shape this gate
+/// closes. Every denial is the same generic 404 as a nonexistent repo so
+/// membership cannot be probed through the git endpoints — with exactly one
+/// carve-out: a **never-bound** repo read by its own authenticated
 /// **announcement author** returns a 404 whose body tells the author how to
 /// bind it (issue #3527: a vanilla NIP-34 client can announce without a
 /// `buzz-channel` tag, and the repo then 404s forever with no explanation
@@ -486,10 +586,10 @@ fn hydrate_error_to_response(owner: &str, repo: &str, err: HydrateError) -> Resp
 async fn authorize_git_read(
     db: &buzz_db::Db,
     community: buzz_core::CommunityId,
-    caller: &nostr::PublicKey,
+    caller: Option<&nostr::PublicKey>,
     owner_hex: &str,
     repo_name: &str,
-) -> Result<(), Response> {
+) -> Result<GitReadAccess, Response> {
     fn denied() -> Response {
         (StatusCode::NOT_FOUND, "repository not found").into_response()
     }
@@ -518,6 +618,17 @@ async fn authorize_git_read(
             error!(repo = %repo_name, error = %e, "git read gate: 30617 lookup failed (deny)");
             return Err(denied());
         }
+    };
+
+    // Public repos are anonymously cloneable regardless of the bound channel's
+    // visibility or the caller's membership.
+    if repo_is_public(&repo_event.event) {
+        return Ok(GitReadAccess::Public);
+    }
+
+    // Private repo: an anonymous caller cannot read it.
+    let Some(caller) = caller else {
+        return Err(denied());
     };
 
     let channel_id = match resolve_repo_binding(&repo_event.event) {
@@ -552,13 +663,46 @@ async fn authorize_git_read(
         .get_member_role(community, channel_id, &caller.to_bytes())
         .await
     {
-        Ok(role) if read_role_allows(role.as_deref()) => Ok(()),
+        Ok(role) if read_role_allows(role.as_deref()) => Ok(GitReadAccess::Authenticated),
         Ok(_) => Err(denied()),
         Err(e) => {
             error!(repo = %repo_name, error = %e, "git read gate: role lookup failed (deny)");
             Err(denied())
         }
     }
+}
+
+/// Apply the relay-membership (NIP-43) gate for an authorized git read.
+///
+/// Public repos skip it entirely; authenticated access to a private repo
+/// enforces it, preserving the behavior that previously lived in the [`GitAuth`]
+/// extractor. Denials return the generic 404 so membership can't be probed.
+async fn enforce_read_relay_membership(
+    state: &Arc<AppState>,
+    auth: &OptionalGitAuth,
+    access: GitReadAccess,
+) -> Result<(), Response> {
+    if matches!(access, GitReadAccess::Public) {
+        return Ok(());
+    }
+    // `Authenticated` implies a private repo authorized via channel membership,
+    // so the caller pubkey is always present here.
+    if let Some(pubkey) = auth.pubkey.as_ref() {
+        if crate::api::relay_members::enforce_relay_membership(
+            state,
+            auth.tenant.community(),
+            pubkey.as_bytes(),
+            auth.auth_tag.as_deref(),
+            auth.signed_auth_created_at,
+        )
+        .await
+        .is_err()
+        {
+            warn!(pubkey = %pubkey.to_hex(), "git: relay membership denied");
+            return Err((StatusCode::NOT_FOUND, "repository not found").into_response());
+        }
+    }
+    Ok(())
 }
 
 /// Pure decision for [`authorize_git_read`]: a read requires a current
@@ -758,7 +902,7 @@ fn build_upload_pack_advertisement(manifest: &super::manifest::Manifest) -> Vec<
 /// error" behavior is gone — A1 detectability holds on the read side too.
 pub async fn info_refs(
     State(state): State<Arc<AppState>>,
-    auth: GitAuth,
+    auth: OptionalGitAuth,
     AxumPath(params): AxumPath<GitRepoParams>,
     Query(query): Query<InfoRefsQuery>,
 ) -> Result<Response, Response> {
@@ -769,17 +913,20 @@ pub async fn info_refs(
     };
     let repo_name = validate_repo_id(&params.owner, &params.repo)?;
 
-    // SEC-005: channel-membership gate before any manifest load, hydration,
-    // or subprocess work. Both services — the receive-pack advertisement
-    // leaks the ref list just like the upload-pack one.
-    authorize_git_read(
+    // SEC-005: public/channel-membership gate before any manifest load,
+    // hydration, or subprocess work. Both services — the receive-pack
+    // advertisement leaks the ref list just like the upload-pack one. A public
+    // repo passes anonymously; a private repo requires an authenticated member
+    // and then the relay-membership gate below.
+    let access = authorize_git_read(
         &state.db,
         auth.tenant.community(),
-        &auth.pubkey,
+        auth.pubkey.as_ref(),
         &params.owner,
         repo_name,
     )
     .await?;
+    enforce_read_relay_membership(&state, &auth, access).await?;
 
     // Track C fast path: only for clone advertisement. The receive-pack
     // advertisement carries a different capability set (report-status,
@@ -1017,7 +1164,7 @@ fn decode_git_request_body(
 /// the tempdir lives only for the duration of this request.
 pub async fn upload_pack(
     State(state): State<Arc<AppState>>,
-    auth: GitAuth,
+    auth: OptionalGitAuth,
     headers: axum::http::HeaderMap,
     AxumPath(params): AxumPath<GitRepoParams>,
     body: Body,
@@ -1027,15 +1174,17 @@ pub async fn upload_pack(
     // SEC-005: the reused NIP-98 token means the GET advertisement's
     // authorization cannot stand in for POST-time membership — gate this
     // door independently, before body decode work is driven or hydration
-    // starts.
-    authorize_git_read(
+    // starts. Public repos pass anonymously; private repos require an
+    // authenticated member plus the relay-membership gate.
+    let access = authorize_git_read(
         &state.db,
         auth.tenant.community(),
-        &auth.pubkey,
+        auth.pubkey.as_ref(),
         &params.owner,
         repo_name,
     )
     .await?;
+    enforce_read_relay_membership(&state, &auth, access).await?;
 
     let body = decode_git_request_body(&headers, body, UPLOAD_PACK_MAX_DECODED_BYTES);
     let permit = acquire_git_permit(&state, "upload_pack")?;
@@ -3305,7 +3454,7 @@ mod sec005_postgres_tests {
     /// can assert on the exact bytes a git client would see. A blind
     /// `.is_err()` cannot distinguish the generic 404 from the remediation
     /// 404 — and that distinction IS the security property.
-    async fn denial_parts(result: Result<(), Response>) -> (StatusCode, String) {
+    async fn denial_parts<T: std::fmt::Debug>(result: Result<T, Response>) -> (StatusCode, String) {
         let response = result.expect_err("expected a denial");
         let status = response.status();
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
@@ -3344,6 +3493,9 @@ mod sec005_postgres_tests {
         /// (whose SQL joins `channels … deleted_at IS NULL`) then returns
         /// no role — the deliberate phase-1 posture for dead bindings.
         UnknownChannel,
+        /// A `["public"]` tag and deliberately NO `buzz-channel` binding —
+        /// proves the public short-circuit runs before the channel gate.
+        Public,
     }
 
     struct RepoFixture {
@@ -3412,6 +3564,9 @@ mod sec005_postgres_tests {
             Binding::UnknownChannel => {
                 tags.push(Tag::parse(["buzz-channel", &uuid::Uuid::new_v4().to_string()]).unwrap());
             }
+            Binding::Public => {
+                tags.push(Tag::parse(["public"]).unwrap());
+            }
         }
         let event = announcement(&owner_keys, tags);
         db.insert_event(community, &event, None)
@@ -3438,7 +3593,7 @@ mod sec005_postgres_tests {
         // Current member: allowed.
         let member = f.member_keys.public_key();
         assert!(
-            authorize_git_read(&f.db, f.community, &member, &f.owner_hex, &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&member), &f.owner_hex, &f.repo)
                 .await
                 .is_ok(),
             "current member must be allowed to read"
@@ -3447,7 +3602,7 @@ mod sec005_postgres_tests {
         // Never-a-member caller: denied.
         let stranger = Keys::generate().public_key();
         assert!(
-            authorize_git_read(&f.db, f.community, &stranger, &f.owner_hex, &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&stranger), &f.owner_hex, &f.repo)
                 .await
                 .is_err(),
             "non-member must be denied"
@@ -3459,7 +3614,7 @@ mod sec005_postgres_tests {
             .await
             .expect("self-remove");
         assert!(
-            authorize_git_read(&f.db, f.community, &member, &f.owner_hex, &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&member), &f.owner_hex, &f.repo)
                 .await
                 .is_err(),
             "removed member must be denied"
@@ -3469,7 +3624,7 @@ mod sec005_postgres_tests {
         // member and must be denied too.
         let owner = f.owner_keys.public_key();
         assert!(
-            authorize_git_read(&f.db, f.community, &owner, &f.owner_hex, &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&owner), &f.owner_hex, &f.repo)
                 .await
                 .is_err(),
             "repo owner outside the channel must be denied (no owner bypass)"
@@ -3484,7 +3639,7 @@ mod sec005_postgres_tests {
         let f = setup_repo(Binding::Missing).await;
         let member = f.member_keys.public_key();
         let (status, body) = denial_parts(
-            authorize_git_read(&f.db, f.community, &member, &f.owner_hex, &f.repo).await,
+            authorize_git_read(&f.db, f.community, Some(&member), &f.owner_hex, &f.repo).await,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3501,7 +3656,7 @@ mod sec005_postgres_tests {
         let g = setup_repo(Binding::Malformed).await;
         let g_owner = g.owner_keys.public_key();
         let (status, body) = denial_parts(
-            authorize_git_read(&g.db, g.community, &g_owner, &g.owner_hex, &g.repo).await,
+            authorize_git_read(&g.db, g.community, Some(&g_owner), &g.owner_hex, &g.repo).await,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3518,7 +3673,7 @@ mod sec005_postgres_tests {
         let u = setup_repo(Binding::UnknownChannel).await;
         let u_owner = u.owner_keys.public_key();
         let (status, body) = denial_parts(
-            authorize_git_read(&u.db, u.community, &u_owner, &u.owner_hex, &u.repo).await,
+            authorize_git_read(&u.db, u.community, Some(&u_owner), &u.owner_hex, &u.repo).await,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3529,7 +3684,14 @@ mod sec005_postgres_tests {
 
         // Nonexistent announcement → deny.
         let (status, body) = denial_parts(
-            authorize_git_read(&f.db, f.community, &member, &f.owner_hex, "no-such-repo").await,
+            authorize_git_read(
+                &f.db,
+                f.community,
+                Some(&member),
+                &f.owner_hex,
+                "no-such-repo",
+            )
+            .await,
         )
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -3541,7 +3703,7 @@ mod sec005_postgres_tests {
         // Owner-mismatch: URL owner differs from announcement author → deny.
         let impostor_hex = Keys::generate().public_key().to_hex();
         assert!(
-            authorize_git_read(&f.db, f.community, &member, &impostor_hex, &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&member), &impostor_hex, &f.repo)
                 .await
                 .is_err(),
             "URL owner that never announced this repo must deny"
@@ -3549,7 +3711,7 @@ mod sec005_postgres_tests {
 
         // Invalid owner hex in URL → deny (never panics).
         assert!(
-            authorize_git_read(&f.db, f.community, &member, "zz-not-hex", &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&member), "zz-not-hex", &f.repo)
                 .await
                 .is_err(),
             "malformed owner hex must deny"
@@ -3567,7 +3729,7 @@ mod sec005_postgres_tests {
         let f = setup_repo(Binding::Missing).await;
         let author = f.owner_keys.public_key();
 
-        let response = authorize_git_read(&f.db, f.community, &author, &f.owner_hex, &f.repo)
+        let response = authorize_git_read(&f.db, f.community, Some(&author), &f.owner_hex, &f.repo)
             .await
             .expect_err("unbound repo must still deny its author");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -3597,7 +3759,7 @@ mod sec005_postgres_tests {
         // who is not the author still gets the generic body.
         let member = f.member_keys.public_key();
         let (_, body) = denial_parts(
-            authorize_git_read(&f.db, f.community, &member, &f.owner_hex, &f.repo).await,
+            authorize_git_read(&f.db, f.community, Some(&member), &f.owner_hex, &f.repo).await,
         )
         .await;
         assert_eq!(body, GENERIC_DENIAL, "remediation is author-only");
@@ -3614,7 +3776,7 @@ mod sec005_postgres_tests {
 
         let member = f.member_keys.public_key();
         assert!(
-            authorize_git_read(&f.db, f.community, &member, &f.owner_hex, &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&member), &f.owner_hex, &f.repo)
                 .await
                 .is_ok(),
             "precondition: member allowed while announcement is live"
@@ -3636,7 +3798,7 @@ mod sec005_postgres_tests {
         assert!(deleted, "precondition: a live announcement row was deleted");
 
         assert!(
-            authorize_git_read(&f.db, f.community, &member, &f.owner_hex, &f.repo)
+            authorize_git_read(&f.db, f.community, Some(&member), &f.owner_hex, &f.repo)
                 .await
                 .is_err(),
             "deleted announcement must deny reads even for channel members"
@@ -3757,6 +3919,34 @@ mod sec005_postgres_tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn read_gate_public_repo_allows_anonymous_and_non_members() {
+        // A `["public"]` announcement is anonymously cloneable and bypasses the
+        // channel-membership gate — even with no buzz-channel binding at all.
+        let f = setup_repo(Binding::Public).await;
+
+        // Anonymous caller → allowed as Public.
+        assert!(
+            matches!(
+                authorize_git_read(&f.db, f.community, None, &f.owner_hex, &f.repo).await,
+                Ok(GitReadAccess::Public)
+            ),
+            "public repo must allow anonymous read"
+        );
+
+        // Authenticated non-member → still allowed as Public (publicness wins).
+        let stranger = Keys::generate().public_key();
+        assert!(
+            matches!(
+                authorize_git_read(&f.db, f.community, Some(&stranger), &f.owner_hex, &f.repo)
+                    .await,
+                Ok(GitReadAccess::Public)
+            ),
+            "public repo must allow an authenticated non-member"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn ban_gate_fails_closed_with_503_when_the_store_is_unreachable() {
         let url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
@@ -3780,5 +3970,30 @@ mod sec005_postgres_tests {
             "a store outage must deny as retryable, never allow and never claim a 403"
         );
         assert_eq!(body, "authorization unavailable");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn read_gate_private_repo_denies_anonymous() {
+        // Without a `["public"]` tag, an anonymous caller is denied — a member
+        // is still allowed (Authenticated), proving only the public tag opens
+        // the anonymous door.
+        let f = setup_repo(Binding::Channel).await;
+
+        assert!(
+            authorize_git_read(&f.db, f.community, None, &f.owner_hex, &f.repo)
+                .await
+                .is_err(),
+            "private repo must deny anonymous read"
+        );
+
+        let member = f.member_keys.public_key();
+        assert!(
+            matches!(
+                authorize_git_read(&f.db, f.community, Some(&member), &f.owner_hex, &f.repo).await,
+                Ok(GitReadAccess::Authenticated)
+            ),
+            "private repo must allow a current member"
+        );
     }
 }

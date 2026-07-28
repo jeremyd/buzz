@@ -860,6 +860,12 @@ pub fn extract_channel_id(event: &nostr::Event) -> Option<Uuid> {
 ///
 /// This is a parameterized replaceable event: publishing again with the same
 /// `repo_id` updates the announcement (relay overwrites the previous one).
+///
+/// When `public` is true the announcement carries a `["public"]` tag, marking
+/// the repo anonymously cloneable/fetchable (no NIP-98 auth, no channel
+/// membership). When false the tag is omitted and the repo stays private
+/// (reads require an authenticated channel member). Push is unaffected either
+/// way.
 pub fn build_repo_announcement(
     repo_id: &str,
     name: Option<&str>,
@@ -867,6 +873,7 @@ pub fn build_repo_announcement(
     clone_urls: &[&str],
     web_url: Option<&str>,
     relays: &[&str],
+    public: bool,
 ) -> Result<EventBuilder, SdkError> {
     // Validate repo_id
     check_repo_id(repo_id)?;
@@ -968,6 +975,9 @@ pub fn build_repo_announcement(
         let mut relay_tag = vec!["relays"];
         relay_tag.extend_from_slice(relays);
         tags.push(tag(&relay_tag)?);
+    }
+    if public {
+        tags.push(tag(&["public"])?);
     }
 
     Ok(EventBuilder::new(Kind::Custom(KIND_GIT_REPO_ANNOUNCEMENT as u16), "").tags(tags))
@@ -3476,12 +3486,18 @@ mod tests {
                 &["https://github.com/example/my-repo.git"],
                 Some("https://github.com/example/my-repo"),
                 &["wss://relay.example.com"],
+                false,
             )
             .unwrap(),
         );
         assert_eq!(ev.kind.as_u16(), 30617);
         assert_eq!(ev.content, "");
         assert!(has_tag(&ev, "d", "my-repo"));
+        // Not public unless requested.
+        assert!(!ev
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(|v| v.as_str()) == Some("public")));
         assert!(has_tag(&ev, "name", "My Repo"));
         assert!(has_tag(&ev, "description", "A test repository"));
         assert!(has_tag(
@@ -3500,7 +3516,8 @@ mod tests {
 
     #[test]
     fn repo_announcement_happy_path_minimal() {
-        let ev = sign(build_repo_announcement("bare-repo", None, None, &[], None, &[]).unwrap());
+        let ev =
+            sign(build_repo_announcement("bare-repo", None, None, &[], None, &[], false).unwrap());
         assert_eq!(ev.kind.as_u16(), 30617);
         assert_eq!(ev.content, "");
         assert!(has_tag(&ev, "d", "bare-repo"));
@@ -3513,6 +3530,13 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.as_slice().first().map(|v| v.as_str()) == Some("clone")));
+    }
+
+    #[test]
+    fn repo_announcement_public_flag_adds_public_tag() {
+        let ev =
+            sign(build_repo_announcement("open-repo", None, None, &[], None, &[], true).unwrap());
+        assert!(ev.tags.iter().any(|t| t.as_slice() == ["public"]));
     }
 
     #[test]
@@ -3545,32 +3569,35 @@ mod tests {
 
     #[test]
     fn repo_announcement_rejects_empty_repo_id() {
-        let err = build_repo_announcement("", None, None, &[], None, &[]).unwrap_err();
+        let err = build_repo_announcement("", None, None, &[], None, &[], false).unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 
     #[test]
     fn repo_announcement_rejects_leading_dot() {
-        let err = build_repo_announcement(".hidden", None, None, &[], None, &[]).unwrap_err();
+        let err =
+            build_repo_announcement(".hidden", None, None, &[], None, &[], false).unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 
     #[test]
     fn repo_announcement_rejects_double_dot() {
-        let err = build_repo_announcement("some..repo", None, None, &[], None, &[]).unwrap_err();
+        let err =
+            build_repo_announcement("some..repo", None, None, &[], None, &[], false).unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 
     #[test]
     fn repo_announcement_rejects_repo_id_over_64_chars() {
         let long_id = "a".repeat(65);
-        let err = build_repo_announcement(&long_id, None, None, &[], None, &[]).unwrap_err();
+        let err = build_repo_announcement(&long_id, None, None, &[], None, &[], false).unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 
     #[test]
     fn repo_announcement_rejects_invalid_chars_in_repo_id() {
-        let err = build_repo_announcement("bad repo!", None, None, &[], None, &[]).unwrap_err();
+        let err =
+            build_repo_announcement("bad repo!", None, None, &[], None, &[], false).unwrap_err();
         assert!(matches!(err, SdkError::InvalidInput(_)));
     }
 
@@ -3587,6 +3614,7 @@ mod tests {
                 ],
                 None,
                 &[],
+                false,
             )
             .unwrap(),
         );
