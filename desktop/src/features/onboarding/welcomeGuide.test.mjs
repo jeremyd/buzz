@@ -2,8 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  activateWelcomeTeamPersonasSequentially,
   buildWelcomeStarterCreateInput,
+  filterWelcomeTeamAgentsMissingFromChannel,
   LEGACY_WELCOME_GUIDE_SYSTEM_PROMPT,
   pickWelcomeGuideAgent,
   pickWelcomeGuideAgentForRelay,
@@ -140,22 +140,58 @@ test("pickWelcomeGuideAgentForRelay returns null when Fizz only exists in anothe
   );
 });
 
-test("starter persona activation is serialized to protect the shared store", async () => {
-  const calls = [];
-  let activeWrites = 0;
+function makeMember(overrides = {}) {
+  return {
+    pubkey: PUB_A,
+    role: "bot",
+    isAgent: true,
+    joinedAt: "2026-06-11T00:00:00.000Z",
+    displayName: null,
+    ...overrides,
+  };
+}
 
-  await activateWelcomeTeamPersonasSequentially(
-    ["builtin:fizz", "builtin:honey", "builtin:bumble"],
-    async (personaId) => {
-      assert.equal(activeWrites, 0, "activation writes must never overlap");
-      activeWrites += 1;
-      calls.push(personaId);
-      await new Promise((resolve) => setTimeout(resolve, 1));
-      activeWrites -= 1;
-    },
+test("filterWelcomeTeamAgentsMissingFromChannel skips same-named agent members", () => {
+  const fizz = makeAgent({ name: "Fizz", pubkey: PUB_A });
+  const honey = makeAgent({ name: "Honey", pubkey: PUB_B });
+  const bumble = makeAgent({ name: "Bumble", pubkey: PUB_C });
+  // A prior install left differently-keyed Fizz/Honey members (case-insensitive).
+  const members = [
+    makeMember({ pubkey: "d".repeat(64), displayName: "Fizz" }),
+    makeMember({ pubkey: "e".repeat(64), displayName: "honey" }),
+  ];
+
+  assert.deepEqual(
+    filterWelcomeTeamAgentsMissingFromChannel([fizz, honey, bumble], members),
+    [bumble],
   );
+});
 
-  assert.deepEqual(calls, ["builtin:fizz", "builtin:honey", "builtin:bumble"]);
+test("filterWelcomeTeamAgentsMissingFromChannel skips pubkeys already present", () => {
+  const fizz = makeAgent({ name: "Fizz", pubkey: PUB_A });
+  const members = [makeMember({ pubkey: PUB_A, displayName: "Renamed Fizz" })];
+
+  assert.deepEqual(
+    filterWelcomeTeamAgentsMissingFromChannel([fizz], members),
+    [],
+  );
+});
+
+test("filterWelcomeTeamAgentsMissingFromChannel ignores non-agent members with a matching name", () => {
+  const fizz = makeAgent({ name: "Fizz", pubkey: PUB_A });
+  // A human happens to be named "Fizz" — must not block the agent.
+  const members = [
+    makeMember({
+      pubkey: PUB_B,
+      role: "member",
+      isAgent: false,
+      displayName: "Fizz",
+    }),
+  ];
+
+  assert.deepEqual(filterWelcomeTeamAgentsMissingFromChannel([fizz], members), [
+    fizz,
+  ]);
 });
 
 test("all Welcome starters use the onboarding runtime preference", async () => {

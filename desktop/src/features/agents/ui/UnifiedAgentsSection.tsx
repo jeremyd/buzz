@@ -64,6 +64,7 @@ type UnifiedAgentsSectionProps = {
   ) => void;
   onDeactivatePersona: (persona: AgentPersona) => void;
   onDeletePersona: (persona: AgentPersona) => void;
+  onRemoveWelcomeTeam: () => void;
 };
 
 const AGENT_CARD_COLUMN_CLASS = "w-full";
@@ -101,6 +102,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     onSharePersona,
     onDeactivatePersona,
     onDeletePersona,
+    onRemoveWelcomeTeam,
   } = props;
 
   const isArchived = useIsArchivedPredicate();
@@ -153,6 +155,7 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                       linkedAgent={profileAgent}
                       onDeactivate={onDeactivatePersona}
                       onDelete={onDeletePersona}
+                      onRemoveWelcomeTeam={onRemoveWelcomeTeam}
                       onDuplicate={onDuplicatePersona}
                       onEdit={onEditPersona}
                       onShare={(persona, linkedAgent) =>

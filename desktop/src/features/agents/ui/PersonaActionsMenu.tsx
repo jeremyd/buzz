@@ -7,6 +7,7 @@ import {
 } from "lucide-react";
 
 import type { AgentPersona, ManagedAgent } from "@/shared/api/types";
+import { WELCOME_TEAM_ID } from "@/features/onboarding/welcomeGuide";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -25,6 +26,7 @@ export function PersonaActionsMenu({
   onShare,
   onDeactivate,
   onDelete,
+  onRemoveWelcomeTeam,
 }: {
   isActionPending: boolean;
   isPending: boolean;
@@ -39,9 +41,12 @@ export function PersonaActionsMenu({
   ) => void;
   onDeactivate: (persona: AgentPersona) => void;
   onDelete: (persona: AgentPersona) => void;
+  /** Remove the built-in Welcome Team (deactivate personas + delete instances). */
+  onRemoveWelcomeTeam: () => void;
 }) {
   const disabled = isActionPending || isPending;
   const canEdit = !persona.sourceTeam;
+  const isWelcomeTeamPersona = persona.sourceTeam === WELCOME_TEAM_ID;
 
   return (
     <DropdownMenu modal={false}>
@@ -79,7 +84,16 @@ export function PersonaActionsMenu({
           Share
         </DropdownMenuItem>
         <DropdownMenuSeparator />
-        {persona.sourceTeam ? (
+        {isWelcomeTeamPersona ? (
+          <DropdownMenuItem
+            className="text-destructive focus:text-destructive"
+            disabled={disabled}
+            onClick={() => onRemoveWelcomeTeam()}
+          >
+            <Trash2 className="h-4 w-4" />
+            Remove Welcome Team
+          </DropdownMenuItem>
+        ) : persona.sourceTeam ? (
           <DropdownMenuItem disabled>
             <Trash2 className="h-4 w-4" />
             Managed by team

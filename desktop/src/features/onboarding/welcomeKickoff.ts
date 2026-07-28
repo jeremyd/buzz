@@ -579,6 +579,10 @@ export function useWelcomeKickoff(
           channelId,
           activeCommunity?.relayUrl,
         );
+        // Null means the user removed the Welcome Team (a starter persona is
+        // deactivated). Don't provision, start, or post an opener — the
+        // dismissal is durable until they re-add the team from Agent Catalog.
+        if (!welcomeTeam) return;
         await queryClient.invalidateQueries({
           queryKey: managedAgentsQueryKey,
         });

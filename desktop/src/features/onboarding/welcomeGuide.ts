@@ -12,10 +12,11 @@ import {
 import { discoverAcpRuntimes } from "@/shared/api/tauriAcpDiscovery";
 import { getAgentAccessOwnerOnly } from "@/shared/api/tauriAgentAccess";
 import { getGlobalAgentConfig } from "@/shared/api/tauriGlobalAgentConfig";
-import { listPersonas, setPersonaActive } from "@/shared/api/tauriPersonas";
+import { listPersonas } from "@/shared/api/tauriPersonas";
 import type {
   AcpRuntime,
   AgentPersona,
+  ChannelMember,
   CreateManagedAgentInput,
   ManagedAgent,
   UpdateManagedAgentInput,
@@ -49,7 +50,10 @@ export const WELCOME_TEAM_STARTERS = [
 
 export type WelcomeTeamAgents = [ManagedAgent, ManagedAgent, ManagedAgent];
 
-const welcomeTeamPromises = new Map<string, Promise<WelcomeTeamAgents>>();
+const welcomeTeamPromises = new Map<
+  string,
+  Promise<WelcomeTeamAgents | null>
+>();
 
 function normalizeRelayUrl(relayUrl: string | null | undefined) {
   return relayUrl?.trim().replace(/\/+$/, "") ?? null;
@@ -148,48 +152,42 @@ export async function getWelcomeGuideAgentPubkeys(relayUrl?: string | null) {
     .map((agent) => agent.pubkey);
 }
 
-export async function activateWelcomeTeamPersonasSequentially(
-  inactivePersonaIds: readonly string[],
-  activate: (personaId: string) => Promise<unknown>,
-) {
-  for (const personaId of inactivePersonaIds) {
-    await activate(personaId);
-  }
-}
-
-async function ensureWelcomeTeamPersonasActive() {
-  const personas = await listPersonas();
-  const personasById = new Map(
-    personas.map((persona) => [persona.id, persona]),
+/**
+ * Welcome Team starters that are not yet represented in the channel roster.
+ * Skips an agent whose pubkey is already a member, and — to survive a fresh
+ * install against a community that already has a differently-keyed Fizz/Honey/
+ * Bumble — also skips a starter whose display name is already occupied by an
+ * agent member (case-insensitive). Ported from upstream block/buzz#2705.
+ */
+export function filterWelcomeTeamAgentsMissingFromChannel(
+  agents: readonly ManagedAgent[],
+  members: readonly ChannelMember[],
+): ManagedAgent[] {
+  const memberPubkeys = new Set(
+    members.map((member) => normalizePubkey(member.pubkey)),
   );
-
-  for (const starter of WELCOME_TEAM_STARTERS) {
-    if (!personasById.has(starter.personaId)) {
-      throw new Error(`${starter.name} agent not found.`);
+  const occupiedAgentNames = new Set(
+    members
+      .filter((member) => member.isAgent)
+      .map((member) => member.displayName?.trim().toLowerCase())
+      .filter((name): name is string => Boolean(name)),
+  );
+  return agents.filter((agent) => {
+    if (memberPubkeys.has(normalizePubkey(agent.pubkey))) {
+      return false;
     }
-  }
-
-  // Persona activation is a read-modify-write operation over one shared file.
-  // Run these sequentially so concurrent writes cannot lose a teammate's
-  // activation and leave Welcome provisioning permanently partial.
-  await activateWelcomeTeamPersonasSequentially(
-    WELCOME_TEAM_STARTERS.filter(
-      ({ personaId }) => !personasById.get(personaId)?.isActive,
-    ).map(({ personaId }) => personaId),
-    (personaId) => setPersonaActive(personaId, true),
-  );
+    return !occupiedAgentNames.has(agent.name.trim().toLowerCase());
+  });
 }
 
 async function ensureWelcomeTeamMembership(
   channelId: string,
-  agents: WelcomeTeamAgents,
+  agents: readonly ManagedAgent[],
 ) {
   const members = await getChannelMembers(channelId).catch(() => []);
-  const memberPubkeys = new Set(
-    members.map((member) => normalizePubkey(member.pubkey)),
-  );
-  const missingAgents = agents.filter(
-    (agent) => !memberPubkeys.has(normalizePubkey(agent.pubkey)),
+  const missingAgents = filterWelcomeTeamAgentsMissingFromChannel(
+    agents,
+    members,
   );
   if (missingAgents.length === 0) {
     return;
@@ -322,9 +320,8 @@ export function welcomeTeammateAccessUpdate(
 async function provisionWelcomeTeam(
   channelId: string,
   relayUrl?: string | null,
-): Promise<WelcomeTeamAgents> {
+): Promise<WelcomeTeamAgents | null> {
   const existingAgents = await listManagedAgents();
-  await ensureWelcomeTeamPersonasActive();
   const [personas, runtimeCatalog, globalConfig, agentAccessOwnerOnly] =
     await Promise.all([
       listPersonas(),
@@ -335,6 +332,18 @@ async function provisionWelcomeTeam(
   const personasById = new Map(
     personas.map((persona) => [persona.id, persona]),
   );
+
+  // Respect user removal. The Welcome Team only (re)provisions while all three
+  // starter personas are active; deleting/deactivating any of them (see
+  // "Remove Welcome Team" in the catalog) is a durable opt-out, so a later
+  // Welcome-channel focus no longer re-mints them. Brand-new users are
+  // unaffected — built-in personas seed active (personas.rs default_active).
+  const allStartersActive = WELCOME_TEAM_STARTERS.every(
+    (starter) => personasById.get(starter.personaId)?.isActive === true,
+  );
+  if (!allStartersActive) {
+    return null;
+  }
   const runtimes = runtimeCatalog.filter(
     (runtime): runtime is AcpRuntime => runtime.availability === "available",
   );
@@ -395,7 +404,7 @@ async function provisionWelcomeTeam(
 export function ensureWelcomeTeam(
   channelId: string,
   relayUrl?: string | null,
-): Promise<WelcomeTeamAgents> {
+): Promise<WelcomeTeamAgents | null> {
   const key = `${normalizeRelayUrl(relayUrl) ?? ""}:${channelId}`;
   const current = welcomeTeamPromises.get(key);
   if (current) return current;

@@ -26,6 +26,10 @@ import { useTeamActions } from "./useTeamActions";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
 import { useBakedBuildEnvQuery } from "@/features/agents/hooks";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import {
+  WELCOME_TEAM_ID,
+  WELCOME_TEAM_STARTERS,
+} from "@/features/onboarding/welcomeGuide";
 import { useGlobalAgentConfig } from "@/features/agents/useGlobalAgentConfig";
 import { Button } from "@/shared/ui/button";
 import {
@@ -63,6 +67,30 @@ export function AgentsView() {
           : compactActionsTriggerRef.current;
     }
     setIsAiDefaultsOpen(open);
+  }
+
+  // Remove the built-in Welcome Team for good: delete its live instances
+  // (tombstone + NIP-IA archive + leave channels) and deactivate the three
+  // starter personas so provisioning never re-mints them. Reversible from the
+  // Agent Catalog (re-adding all three re-provisions on the next Welcome focus).
+  async function handleRemoveWelcomeTeam() {
+    const confirmed = window.confirm(
+      "Remove the Welcome Team (Fizz, Honey, Bumble)? Their agent identities are archived on the relay and they won't be re-created. You can add them back later from Agent Catalog.",
+    );
+    if (!confirmed) return;
+    const welcomeInstances = agents.managedAgents.filter(
+      (agent) => agent.teamId === WELCOME_TEAM_ID,
+    );
+    for (const instance of welcomeInstances) {
+      await agents.handleDelete(instance.pubkey);
+    }
+    const allPersonas = personas.personasQuery.data ?? [];
+    for (const starter of WELCOME_TEAM_STARTERS) {
+      const persona = allPersonas.find((p) => p.id === starter.personaId);
+      if (persona?.isActive) {
+        await personas.handleSetActive(persona, false, "library");
+      }
+    }
   }
 
   const teamActions = useTeamActions(
@@ -276,6 +304,7 @@ export function AgentsView() {
                 void personas.handleSetActive(persona, false, "library");
               }}
               onDeletePersona={personas.openDelete}
+              onRemoveWelcomeTeam={() => void handleRemoveWelcomeTeam()}
             />
 
             <TeamsSection
