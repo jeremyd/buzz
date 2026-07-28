@@ -305,13 +305,15 @@ pub async fn cmd_set_visibility(
         tags.push(Tag::parse(["public"]).map_err(tag_error)?);
     }
 
-    // Advance only the observed head so a delayed writer can't leapfrog an
-    // intervening update and silently erase metadata (mirrors protection edits).
-    let next_created_at = existing
-        .created_at
-        .as_secs()
-        .checked_add(1)
-        .ok_or_else(|| CliError::Other("repository timestamp cannot be advanced".into()))?;
+    // Supersede the current announcement under NIP-33 LWW: created_at must be
+    // strictly greater than the existing one. But it must ALSO fall within the
+    // relay's accept window of server time — for an announcement created a while
+    // ago, `existing + 1` is far in the past and the relay rejects it with
+    // "timestamp too far from server time". Clamp up to now so both hold.
+    let next_created_at = std::cmp::max(
+        Timestamp::now().as_secs(),
+        existing.created_at.as_secs().saturating_add(1),
+    );
     let builder =
         buzz_sdk::build_repo_announcement_with_tags(&canonical_id, &existing.content, tags)
             .map_err(|error| {
