@@ -408,6 +408,108 @@ async fn git_clone_push_fetch_force_roundtrip() {
     assert!(tags.contains("v1.0"), "tag v1.0 cloned back: {tags}");
 }
 
+/// Regression: pushing to a repo marked `["public"]` must still work.
+///
+/// The public-repo feature made `info/refs?service=git-receive-pack`
+/// anonymously accessible, so a push never received the 401 + `WWW-Authenticate:
+/// Nostr` challenge during ref discovery — git never invoked the credential
+/// helper and the authenticated `git-receive-pack` POST dead-ended in
+/// "could not read Username". The push advertisement must challenge anonymous
+/// callers even when the repo is public (the GitHub model), while anonymous
+/// clone/fetch stays open.
+#[tokio::test]
+#[ignore = "requires live relay + MinIO + git"]
+async fn git_public_repo_push_challenges_and_anonymous_clone_works() {
+    use nostr::ToBech32;
+
+    let owner = Keys::generate();
+    let owner_hex = owner.public_key().to_hex();
+    let owner_nsec = owner.secret_key().to_bech32().unwrap();
+    let repo = format!("e2e-git-pub-{}", std::process::id());
+
+    // Announce a PUBLIC repo (kind:30617 with a ["public"] tag).
+    let announce = EventBuilder::new(Kind::from(30617), "")
+        .tags(vec![
+            Tag::parse(["d", &repo]).unwrap(),
+            Tag::parse(["name", "e2e public git repo"]).unwrap(),
+            Tag::parse(["public"]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    post_event(&announce).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let tmp = tempdir();
+    let url = format!("{}/git/{}/{}", relay_http_url(), owner_hex, repo);
+
+    // Anonymous receive-pack ref discovery must 401 with the Nostr challenge —
+    // this is what bootstraps git's credential helper for push.
+    let resp = reqwest::get(format!("{url}/info/refs?service=git-receive-pack"))
+        .await
+        .expect("anonymous receive-pack info/refs request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "anonymous receive-pack advertisement must 401 even on a public repo"
+    );
+    let challenge = resp
+        .headers()
+        .get("www-authenticate")
+        .expect("401 must carry WWW-Authenticate")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        challenge.starts_with("Nostr "),
+        "challenge must be Nostr, got: {challenge}"
+    );
+
+    // Authenticated clone + push round-trips on the public repo — the exact
+    // flow that regressed.
+    git(
+        &["clone", "--quiet", &url, "clone-owner"],
+        tmp.path(),
+        &owner_nsec,
+    );
+    let clone_owner = tmp.path().join("clone-owner");
+    std::fs::write(clone_owner.join("README.md"), "public\n").unwrap();
+    git(&["add", "."], &clone_owner, &owner_nsec);
+    git(
+        &["commit", "--quiet", "-m", "initial"],
+        &clone_owner,
+        &owner_nsec,
+    );
+    git(&["branch", "-M", "main"], &clone_owner, &owner_nsec);
+    git(
+        &["push", "--quiet", "origin", "main"],
+        &clone_owner,
+        &owner_nsec,
+    );
+
+    // Anonymous clone (no key, no credential helper) sees the pushed content.
+    let anon_clone = tmp.path().join("clone-anon");
+    let out = Command::new("git")
+        .args(["clone", "--quiet", &url])
+        .arg(&anon_clone)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("spawn anonymous git clone");
+    assert!(
+        out.status.success(),
+        "anonymous clone of public repo failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(anon_clone.join("README.md")).unwrap(),
+        "public\n",
+        "anonymous clone sees pushed content"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires live relay + MinIO + git"]
 async fn git_concurrent_push_one_wins_and_repo_recovers() {

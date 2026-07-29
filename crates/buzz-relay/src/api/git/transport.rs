@@ -280,6 +280,24 @@ async fn bind_git_tenant(
         .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())
 }
 
+/// Build the 401 response carrying the `WWW-Authenticate: Nostr ...` challenge.
+///
+/// This challenge is what bootstraps git's credential flow: git only invokes
+/// the credential helper with a `wwwauth[]=Nostr ...` line when the server
+/// presents this header, and `git-credential-nostr` emits a credential only
+/// when it sees that line. A 401 without it dead-ends the client in
+/// username/password prompting ("could not read Username").
+fn nostr_auth_challenge(method: &str, body: &'static str) -> Response {
+    Response::builder()
+        .status(StatusCode::UNAUTHORIZED)
+        .header(
+            "WWW-Authenticate",
+            format!("Nostr realm=\"buzz\", method=\"{method}\""),
+        )
+        .body(Body::from(body))
+        .unwrap()
+}
+
 /// Verify the `Authorization: Nostr <base64>` NIP-98 token for a git request,
 /// given an already-bound `tenant`. Returns the caller pubkey, any NIP-OA
 /// auth tag (from the signed event, else the `x-auth-tag` header), and the
@@ -300,27 +318,11 @@ fn verify_git_auth(
         .headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| {
-            Response::builder()
-                .status(StatusCode::UNAUTHORIZED)
-                .header(
-                    "WWW-Authenticate",
-                    format!("Nostr realm=\"buzz\", method=\"{method}\""),
-                )
-                .body(Body::from("missing Authorization header"))
-                .unwrap()
-        })?;
+        .ok_or_else(|| nostr_auth_challenge(method, "missing Authorization header"))?;
 
-    let token = auth_header.strip_prefix("Nostr ").ok_or_else(|| {
-        Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
-            .header(
-                "WWW-Authenticate",
-                format!("Nostr realm=\"buzz\", method=\"{method}\""),
-            )
-            .body(Body::from("expected Authorization: Nostr <base64>"))
-            .unwrap()
-    })?;
+    let token = auth_header
+        .strip_prefix("Nostr ")
+        .ok_or_else(|| nostr_auth_challenge(method, "expected Authorization: Nostr <base64>"))?;
 
     let event_bytes = base64::engine::general_purpose::STANDARD
         .decode(token)
@@ -674,9 +676,11 @@ async fn authorize_git_read(
 
 /// Apply the relay-membership (NIP-43) gate for an authorized git read.
 ///
-/// Public repos skip it entirely; authenticated access to a private repo
-/// enforces it, preserving the behavior that previously lived in the [`GitAuth`]
-/// extractor. Denials return the generic 404 so membership can't be probed.
+/// Public repos skip it entirely for clone/fetch; authenticated access to a
+/// private repo — and the receive-pack advertisement regardless of visibility
+/// — enforces it, preserving the behavior that previously lived in the
+/// [`GitAuth`] extractor. Denials return the generic 404 so membership can't
+/// be probed.
 async fn enforce_read_relay_membership(
     state: &Arc<AppState>,
     auth: &OptionalGitAuth,
@@ -685,8 +689,9 @@ async fn enforce_read_relay_membership(
     if matches!(access, GitReadAccess::Public) {
         return Ok(());
     }
-    // `Authenticated` implies a private repo authorized via channel membership,
-    // so the caller pubkey is always present here.
+    // `Authenticated` implies either a private-repo read authorized via
+    // channel membership or a receive-pack advertisement (which 401s anonymous
+    // callers up front), so the caller pubkey is always present here.
     if let Some(pubkey) = auth.pubkey.as_ref() {
         if crate::api::relay_members::enforce_relay_membership(
             state,
@@ -911,6 +916,19 @@ pub async fn info_refs(
         "git-upload-pack" | "git-receive-pack" => &query.service,
         _ => return Err((StatusCode::BAD_REQUEST, "invalid service").into_response()),
     };
+
+    // The push advertisement always requires an authenticated caller, even on
+    // a public repo (the GitHub model: anonymous `info/refs?service=
+    // git-receive-pack` is 401 regardless of visibility). This 401 is also
+    // load-bearing for the client: git negotiates credentials during ref
+    // discovery, so an anonymous 200 here means git never obtains a Nostr
+    // credential and the authenticated `git-receive-pack` POST then fails
+    // client-side. Challenged before the repo lookup so existence can't be
+    // probed anonymously through the push path.
+    if service == "git-receive-pack" && auth.pubkey.is_none() {
+        return Err(nostr_auth_challenge("GET", "authentication required"));
+    }
+
     let repo_name = validate_repo_id(&params.owner, &params.repo)?;
 
     // SEC-005: public/channel-membership gate before any manifest load,
@@ -926,6 +944,16 @@ pub async fn info_refs(
         repo_name,
     )
     .await?;
+
+    // Mirror the receive-pack POST gates on its advertisement: relay
+    // membership is enforced for the (always-authenticated) push path even
+    // when the repo is public. `GitReadAccess::Public` skips the gate only
+    // for clone/fetch.
+    let access = if service == "git-receive-pack" {
+        GitReadAccess::Authenticated
+    } else {
+        access
+    };
     enforce_read_relay_membership(&state, &auth, access).await?;
 
     // Track C fast path: only for clone advertisement. The receive-pack
@@ -2829,6 +2857,23 @@ mod track_c_tests {
         async fn finalize_push_db_failure_after_cas_is_not_success_and_releases_lease() {
             super::finalize_push_db_failure_after_cas_is_not_success_and_releases_lease().await;
         }
+    }
+
+    /// The auth challenge must carry the `WWW-Authenticate: Nostr ...` header
+    /// in exactly the shape `git-credential-nostr` parses — without it, git
+    /// falls back to username/password prompting and pushes fail with
+    /// "could not read Username" (the public-repo push regression).
+    #[test]
+    fn nostr_auth_challenge_carries_parseable_wwwauthenticate() {
+        let resp = nostr_auth_challenge("GET", "authentication required");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        let header = resp
+            .headers()
+            .get("WWW-Authenticate")
+            .expect("WWW-Authenticate header present")
+            .to_str()
+            .unwrap();
+        assert_eq!(header, "Nostr realm=\"buzz\", method=\"GET\"");
     }
 
     /// A gzip-encoded request body is transparently inflated before it
