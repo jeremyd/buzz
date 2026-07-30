@@ -5,6 +5,7 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:gpt_markdown/gpt_markdown.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../../shared/markdown/markdown_components.dart';
 import '../../../shared/theme/theme.dart';
 import 'observer_models.dart';
 
@@ -72,6 +73,7 @@ class _MessageItemWidget extends StatelessWidget {
               style: context.textTheme.bodyMedium?.copyWith(
                 color: context.colors.onSurface,
               ),
+              inlineComponents: safeInlineComponents(),
             ),
         ],
       ),
@@ -143,6 +145,7 @@ class _ThoughtItemWidget extends HookWidget {
                   style: context.textTheme.bodySmall?.copyWith(
                     color: context.colors.onSurfaceVariant,
                   ),
+                  inlineComponents: safeInlineComponents(),
                 ),
               ],
             ],

@@ -1033,6 +1033,69 @@ void main() {
           TextDecoration.underline,
         );
       });
+
+      // gpt_markdown's stock link regex is greedy: a bracket pair anywhere
+      // before a link used to make the combined component match swallow
+      // everything from that bracket to the link and render an empty span —
+      // blanking the whole body of bot messages like "[1] see https://…".
+      testWidgets('a bracket pair before a bare URL does not blank the body', (
+        tester,
+      ) async {
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(content: '[INFO] see https://example.com'),
+          ),
+        );
+
+        expect(_allRichText(tester), contains('see'));
+        expect(find.text('https://example.com'), findsOneWidget);
+      });
+
+      testWidgets('bracket pair and link on separate lines both render', (
+        tester,
+      ) async {
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: '[INFO] deployed\nsee https://example.com',
+            ),
+          ),
+        );
+
+        final allText = _allRichText(tester);
+        expect(allText, contains('deployed'));
+        expect(allText, contains('see'));
+        expect(find.text('https://example.com'), findsOneWidget);
+      });
+
+      testWidgets('bare URLs on consecutive lines both render', (tester) async {
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: 'https://a.example.com\nhttps://b.example.com',
+            ),
+          ),
+        );
+
+        expect(find.text('https://a.example.com'), findsOneWidget);
+        expect(find.text('https://b.example.com'), findsOneWidget);
+      });
+
+      testWidgets('two markdown links in one line both render', (tester) async {
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content:
+                  '[alpha](https://a.example.com) and '
+                  '[beta](https://b.example.com)',
+            ),
+          ),
+        );
+
+        expect(find.text('alpha'), findsOneWidget);
+        expect(find.text('beta'), findsOneWidget);
+        expect(_allRichText(tester), contains('and'));
+      });
     });
 
     group('code blocks', () {

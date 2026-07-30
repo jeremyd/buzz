@@ -25,6 +25,7 @@ import '../../shared/custom_emoji/custom_emoji_provider.dart';
 import '../../shared/custom_emoji/custom_emoji_render.dart';
 import '../../shared/emoji/emoji_data_provider.dart';
 import '../../shared/emoji/emoji_only.dart';
+import '../../shared/markdown/markdown_components.dart';
 import 'channels_provider.dart';
 import 'media_viewer_page.dart';
 import 'message_content/link_normalizer.dart';
@@ -298,7 +299,7 @@ class MessageContent extends HookConsumerWidget {
             channelNames: resolvedChannelNames,
             onChannelTap: resolvedChannelTap,
           ),
-          ...MarkdownComponent.inlineComponents,
+          ...safeInlineComponents(),
         ],
       ),
     );
