@@ -14,7 +14,9 @@
 # Binaries are published to the project's generic package registry
 # (Deploy → Package registry) instead of job artifacts: the instance caps
 # job artifacts at ~100 MB and the AppImage alone exceeds that. Package
-# version is the tag when building a tag, else 0.0.0-<short-sha>.
+# version comes from scripts/fork-version.sh: the tag when building a tag,
+# else v<upstream desktop version>-<short-sha> (e.g. v0.5.5-abc12345),
+# anchored on desktop/package.json so fork builds track upstream releases.
 
 stages:
   - build
@@ -83,7 +85,7 @@ desktop-linux:
     # binary finds its sidecars when run from the extracted directory.
     # A tarball (rather than loose binary uploads) keeps the +x bits intact.
     - |
-      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
       STAGE="buzz-${VERSION}-linux-x86_64"
       mkdir -p "dist-bin/${STAGE}"
       cp target/release/buzz-acp target/release/buzz-agent target/release/buzz-dev-mcp \
@@ -115,7 +117,7 @@ arch-pkg:
   needs: ["desktop-linux"]
   script:
     - |
-      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
       # pacman versions cannot contain hyphens.
       PKGVER="$(printf '%s' "$VERSION" | tr - _)"
       TARBALL="buzz-${VERSION}-linux-x86_64.tar.gz"
@@ -139,7 +141,7 @@ arch-pkg:
     - useradd -m builder && chown -R builder /tmp/archbuild
     - su builder -c "cd /tmp/archbuild && makepkg --noconfirm --nodeps"
     - |
-      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
       PKGFILE=$(find /tmp/archbuild -maxdepth 1 -name 'buzz-*.pkg.tar.zst' | head -1)
       [ -n "$PKGFILE" ] || { echo "No package produced"; exit 1; }
       NAME=$(basename "$PKGFILE")
@@ -221,7 +223,7 @@ desktop-windows:
     # baseline.
     - (cd desktop && CFLAGS="-msse4.1" CXXFLAGS="-msse4.1" pnpm tauri build --verbose --ci --runner cargo-xwin --target "$TARGET" --bundles nsis)
     - |
-      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
       EXE=$(find "desktop/src-tauri/target/${TARGET}/release/bundle/nsis" -name '*.exe' -type f | head -1)
       [ -n "$EXE" ] || { echo "No NSIS installer produced"; exit 1; }
       mkdir -p dist
@@ -229,7 +231,7 @@ desktop-windows:
     # CLI/sidecar bundle mirroring the Linux binary tarball, as a zip because
     # that's the native archive shape on Windows (no +x bits to preserve).
     - |
-      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
       STAGE="buzz-${VERSION}-windows-x86_64"
       mkdir -p "dist-bin/${STAGE}"
       for bin in buzz-acp buzz-agent buzz-dev-mcp git-credential-nostr buzz; do
@@ -240,7 +242,7 @@ desktop-windows:
       (cd dist && sha256sum * > SHA256SUMS)
       ls -lh dist/
     - |
-      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
       for f in dist/*; do
         NAME=$(basename "$f")
         URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-windows/${VERSION}/${NAME}"
@@ -266,7 +268,7 @@ android-apk:
     - flutter build apk --release
     - ls -lh build/app/outputs/flutter-apk/
     - |
-      VERSION="${CI_COMMIT_TAG:-0.0.0-${CI_COMMIT_SHORT_SHA}}"
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
       APK="build/app/outputs/flutter-apk/app-release.apk"
       URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-android/${VERSION}/buzz-${VERSION}.apk"
       echo "Uploading APK -> ${URL}"
