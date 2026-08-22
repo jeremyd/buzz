@@ -1,8 +1,8 @@
 # GitLab CI for the relay.tools fork — builds distributable artifacts.
 #
 # Scope: Linux desktop bundles (deb + AppImage + binary tarball + Arch
-# package), a cross-compiled Windows NSIS installer, and the signed Android
-# APK. macOS/iOS need Apple runners this instance doesn't have; docker images
+# package + a devtools-enabled -debug binary/package variant), a
+# cross-compiled Windows NSIS installer, and the signed Android APK. macOS/iOS need Apple runners this instance doesn't have; docker images
 # are deliberately out of scope for now.
 #
 # Recipes are ported from .github/workflows/release.yml (release-linux job).
@@ -94,6 +94,20 @@ desktop-linux:
          "dist-bin/${STAGE}/"
       strip "dist-bin/${STAGE}"/*
       tar --owner=0 --group=0 -C dist-bin -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+    # Debug variant: same release profile plus the `devtools` cargo feature, so
+    # the shipped app has the WebKit inspector (right-click → Inspect Element,
+    # JS console, network tab). Runs after the release bundles so it can't
+    # contaminate them: it overwrites target/release/buzz-desktop, which the
+    # release tarball above has already copied out. Binary-only (--no-bundle),
+    # left unstripped for usable backtraces; sidecars ship in the main package
+    # and resolve via PATH, so the tarball carries just the desktop binary,
+    # renamed buzz-desktop-debug so both variants can coexist in /usr/bin.
+    - (cd desktop && pnpm tauri build --verbose --ci --no-bundle --features devtools)
+    - |
+      DBGSTAGE="buzz-${VERSION}-debug-linux-x86_64"
+      mkdir -p "dist-bin/${DBGSTAGE}"
+      cp desktop/src-tauri/target/release/buzz-desktop "dist-bin/${DBGSTAGE}/buzz-desktop-debug"
+      tar --owner=0 --group=0 -C dist-bin -czf "dist/${DBGSTAGE}.tar.gz" "${DBGSTAGE}"
       (cd dist && sha256sum * > SHA256SUMS)
       ls -lh dist/
     - |
@@ -151,6 +165,31 @@ arch-pkg:
       curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$PKGFILE" "$URL"
       echo
       echo "Install with: sudo pacman -U ${NAME}"
+    # Same recipe for the -debug companion package (buzz-desktop-debug, from
+    # the devtools-enabled tarball; see PKGBUILD-debug for what it ships).
+    - |
+      VERSION="$("${CI_PROJECT_DIR}/scripts/fork-version.sh")"
+      PKGVER="$(printf '%s' "$VERSION" | tr - _)"
+      TARBALL="buzz-${VERSION}-debug-linux-x86_64.tar.gz"
+      BUILD=/tmp/archbuild-debug
+      mkdir -p "$BUILD"
+      sed -e "s/@PKGVER@/${PKGVER}/g" -e "s/@VERSION@/${VERSION}/g" \
+        packaging/arch/PKGBUILD-debug > "$BUILD/PKGBUILD"
+      curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" -o "$BUILD/$TARBALL" \
+        "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-linux/${VERSION}/${TARBALL}"
+      SUM=$(sha256sum "$BUILD/$TARBALL" | cut -d' ' -f1)
+      sed -i "s/@SHA256@/${SUM}/" "$BUILD/PKGBUILD"
+      chown -R builder "$BUILD"
+      su builder -c "cd $BUILD && makepkg --noconfirm --nodeps"
+      PKGFILE=$(find "$BUILD" -maxdepth 1 -name 'buzz-desktop-debug-*.pkg.tar.zst' | head -1)
+      [ -n "$PKGFILE" ] || { echo "No debug package produced"; exit 1; }
+      NAME=$(basename "$PKGFILE")
+      sha256sum "$PKGFILE"
+      URL="${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/buzz-desktop-linux/${VERSION}/${NAME}"
+      echo "Uploading ${NAME} -> ${URL}"
+      curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$PKGFILE" "$URL"
+      echo
+      echo "Install with: sudo pacman -U ${NAME} (runs as /usr/bin/buzz-desktop-debug)"
 
 # Cross-compiles the Windows desktop app from a Linux pod — no Windows runner
 # needed. Tauri v2 supports this officially (flagged experimental, NSIS only):

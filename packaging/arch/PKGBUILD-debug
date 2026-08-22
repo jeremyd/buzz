@@ -1,0 +1,26 @@
+# Maintainer: cloudfodder <cloudfodder@relay.tools>
+#
+# Debug companion to the main `buzz` package: the same release-profile desktop
+# binary built with the `devtools` cargo feature, installed as
+# /usr/bin/buzz-desktop-debug so it coexists with the regular app. Built by the
+# arch-pkg CI job from the buzz-desktop-linux -debug tarball — not from source.
+# @PKGVER@, @VERSION@ and @SHA256@ are substituted by CI before makepkg runs.
+pkgname=buzz-desktop-debug
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="Buzz desktop with the WebKit inspector compiled in (right-click → Inspect Element)"
+arch=('x86_64')
+url="https://code.relay.tools/forks/buzz"
+license=('Apache-2.0')
+# Sidecar binaries (buzz-acp, buzz-agent, …) come from the main package and
+# resolve via PATH.
+depends=('buzz' 'webkit2gtk-4.1' 'gtk3' 'alsa-lib' 'gcc-libs' 'glibc')
+# Deliberately unstripped for usable backtraces.
+options=('!strip' '!debug')
+source=("buzz-@VERSION@-debug-linux-x86_64.tar.gz")
+sha256sums=('@SHA256@')
+
+package() {
+  cd "buzz-@VERSION@-debug-linux-x86_64"
+  install -Dm755 buzz-desktop-debug "$pkgdir/usr/bin/buzz-desktop-debug"
+}

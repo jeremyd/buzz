@@ -44,6 +44,11 @@ The dance:
 
 GitLab CI (`.gitlab-ci.yml`) publishes Linux/Windows desktop bundles, an
 Arch package, and a signed Android APK to the project package registry.
+Each Linux build also ships a `-debug` variant (tarball + `buzz-desktop-debug`
+Arch package): the same release-profile app compiled with the `devtools`
+cargo feature, so the WebKit inspector (right-click → Inspect Element, JS
+console) is available. It installs as `/usr/bin/buzz-desktop-debug` next to
+the regular app.
 Versions come from `scripts/fork-version.sh`:
 
 - Tag builds use the tag as-is.

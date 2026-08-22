@@ -27,6 +27,10 @@ mesh-llm = ["dep:iroh", "dep:mesh-llm-sdk", "dep:mesh-llm-host-runtime", "dep:me
 # OS keyring backing for desktop secret storage (nsec private keys). When
 # disabled, secrets fall back to 0o600 files. On by default for real builds.
 system-keyring = ["dep:keyring"]
+# Compiles the WebKit inspector into a release-profile build (right-click →
+# Inspect Element, JS console, network tab). Used by the fork CI's -debug
+# Linux package; never enabled for regular release artifacts.
+devtools = ["tauri/devtools"]
 
 [build-dependencies]
 base64 = "0.22"
