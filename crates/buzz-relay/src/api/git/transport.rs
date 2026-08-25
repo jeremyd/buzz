@@ -575,7 +575,12 @@ fn repo_is_public(event: &nostr::Event) -> bool {
 /// unknown role, and every DB error all deny. There is deliberately **no
 /// repo-owner bypass** for private repos: an owner removed from the bound
 /// channel loses read access, which is the exact exploit shape this gate
-/// closes. Every denial is the same generic 404 as a nonexistent repo so
+/// closes. An **anonymous** denial is a 401 carrying the
+/// `WWW-Authenticate: Nostr` challenge — uniformly, whether the repo is
+/// private or nonexistent — because that challenge is what makes git fetch a
+/// credential and retry (without it, private repos are uncloneable even for
+/// members). Every **authenticated** denial is the same generic 404 as a
+/// nonexistent repo so
 /// membership cannot be probed through the git endpoints — with exactly one
 /// carve-out: a **never-bound** repo read by its own authenticated
 /// **announcement author** returns a 404 whose body tells the author how to
@@ -592,9 +597,24 @@ async fn authorize_git_read(
     owner_hex: &str,
     repo_name: &str,
 ) -> Result<GitReadAccess, Response> {
-    fn denied() -> Response {
-        (StatusCode::NOT_FOUND, "repository not found").into_response()
-    }
+    // An anonymous denial must carry the `WWW-Authenticate: Nostr` challenge,
+    // not the generic 404: git only obtains a Nostr credential when ref
+    // discovery answers 401 + challenge (see [`nostr_auth_challenge`]), so a
+    // bare 404 dead-ends `git clone` of a private repo even for a channel
+    // member — the client never authenticates at all. Challenging every
+    // anonymous denial uniformly (private and nonexistent repos alike) keeps
+    // existence unprobeable without credentials; authenticated denials keep
+    // the generic 404. `method="GET"` matches the receive-pack advertisement
+    // gate: NIP-98 method binding is deliberately skipped on git routes (the
+    // ref-discovery token is reused for the POST), so the advertised method
+    // only tells the credential helper what to sign.
+    let denied = || -> Response {
+        if caller.is_none() {
+            nostr_auth_challenge("GET", "authentication required")
+        } else {
+            (StatusCode::NOT_FOUND, "repository not found").into_response()
+        }
+    };
 
     let Ok(owner_bytes) = hex::decode(owner_hex) else {
         return Err(denied());
@@ -4025,11 +4045,13 @@ mod sec005_postgres_tests {
         // the anonymous door.
         let f = setup_repo(Binding::Channel).await;
 
-        assert!(
-            authorize_git_read(&f.db, f.community, None, &f.owner_hex, &f.repo)
-                .await
-                .is_err(),
-            "private repo must deny anonymous read"
+        // The anonymous denial must be the 401 challenge, not the generic 404:
+        // the challenge is what makes git invoke the credential helper and
+        // retry authenticated. A 404 here left private repos uncloneable even
+        // for channel members (git never sent credentials at all).
+        assert_anonymous_challenge(
+            authorize_git_read(&f.db, f.community, None, &f.owner_hex, &f.repo).await,
+            "private repo anonymous read",
         );
 
         let member = f.member_keys.public_key();
@@ -4040,5 +4062,50 @@ mod sec005_postgres_tests {
             ),
             "private repo must allow a current member"
         );
+    }
+
+    /// Assert a denial is the anonymous 401 + `WWW-Authenticate: Nostr`
+    /// challenge in exactly the shape `git-credential-nostr` parses.
+    fn assert_anonymous_challenge<T: std::fmt::Debug>(result: Result<T, Response>, what: &str) {
+        let response = result.expect_err(&format!("{what}: expected a denial"));
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{what}: anonymous denial must be 401, not a challenge-less status"
+        );
+        let header = response
+            .headers()
+            .get("WWW-Authenticate")
+            .unwrap_or_else(|| panic!("{what}: WWW-Authenticate header present"))
+            .to_str()
+            .unwrap();
+        assert_eq!(header, "Nostr realm=\"buzz\", method=\"GET\"");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn read_gate_challenges_anonymous_uniformly_for_missing_repos() {
+        // A nonexistent repo and a private repo must be indistinguishable to
+        // an anonymous caller: both answer the 401 challenge. If the missing
+        // repo 404'd while the private repo 401'd, private-repo existence
+        // could be probed without credentials.
+        let db = setup_db().await;
+        let community = buzz_core::CommunityId::from_uuid(uuid::Uuid::new_v4());
+        let owner_hex = Keys::generate().public_key().to_hex();
+        let repo = format!("no-such-repo-{}", uuid::Uuid::new_v4().simple());
+
+        assert_anonymous_challenge(
+            authorize_git_read(&db, community, None, &owner_hex, &repo).await,
+            "missing repo anonymous read",
+        );
+
+        // Authenticated caller on the same missing repo keeps the generic 404.
+        let caller = Keys::generate().public_key();
+        let (status, body) = denial_parts(
+            authorize_git_read(&db, community, Some(&caller), &owner_hex, &repo).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body, GENERIC_DENIAL);
     }
 }

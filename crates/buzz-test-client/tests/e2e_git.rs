@@ -510,6 +510,124 @@ async fn git_public_repo_push_challenges_and_anonymous_clone_works() {
     );
 }
 
+/// Private-repo clone regression — the upload-pack twin of the public-repo
+/// push regression above. The anonymous ref-discovery GET on a private repo
+/// must 401 with the Nostr challenge: that challenge is the only thing that
+/// makes git invoke `git-credential-nostr` and retry authenticated. When it
+/// regressed to a challenge-less 404, private repos were uncloneable even for
+/// channel members (push kept working because the receive-pack advertisement
+/// still challenged).
+#[tokio::test]
+#[ignore = "requires live relay + MinIO + git"]
+async fn git_private_repo_clone_challenges_and_member_clone_works() {
+    use nostr::ToBech32;
+
+    let owner = Keys::generate();
+    let owner_hex = owner.public_key().to_hex();
+    let owner_nsec = owner.secret_key().to_bech32().unwrap();
+    let repo = format!("e2e-git-priv-{}", std::process::id());
+
+    // Announce a PRIVATE repo (no ["public"] tag) bound to a channel the
+    // owner belongs to.
+    let channel = create_test_channel(&owner).await;
+    let announce = EventBuilder::new(Kind::from(30617), "")
+        .tags(vec![
+            Tag::parse(["d", &repo]).unwrap(),
+            Tag::parse(["name", "e2e private git repo"]).unwrap(),
+            Tag::parse(["buzz-channel", &channel]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    post_event(&announce).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let tmp = tempdir();
+    let url = format!("{}/git/{}/{}", relay_http_url(), owner_hex, repo);
+
+    // Anonymous upload-pack ref discovery must 401 with the Nostr challenge.
+    let resp = reqwest::get(format!("{url}/info/refs?service=git-upload-pack"))
+        .await
+        .expect("anonymous upload-pack info/refs request");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "anonymous upload-pack advertisement on a private repo must 401 + challenge"
+    );
+    let challenge = resp
+        .headers()
+        .get("www-authenticate")
+        .expect("401 must carry WWW-Authenticate")
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        challenge.starts_with("Nostr "),
+        "challenge must be Nostr, got: {challenge}"
+    );
+
+    // A nonexistent repo answers the same challenge anonymously — a 404 here
+    // would let private-repo existence be probed without credentials.
+    let missing_url = format!(
+        "{}/git/{}/no-such-repo-{}",
+        relay_http_url(),
+        owner_hex,
+        std::process::id()
+    );
+    let resp = reqwest::get(format!("{missing_url}/info/refs?service=git-upload-pack"))
+        .await
+        .expect("anonymous info/refs on missing repo");
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "missing repo must be indistinguishable from a private one anonymously"
+    );
+
+    // Member clone via the credential helper works end-to-end: clone, push,
+    // fresh clone observes the content.
+    git(
+        &["clone", "--quiet", &url, "clone-member"],
+        tmp.path(),
+        &owner_nsec,
+    );
+    let clone_member = tmp.path().join("clone-member");
+    std::fs::write(clone_member.join("README.md"), "private\n").unwrap();
+    git(&["add", "."], &clone_member, &owner_nsec);
+    git(
+        &["commit", "--quiet", "-m", "initial"],
+        &clone_member,
+        &owner_nsec,
+    );
+    git(&["branch", "-M", "main"], &clone_member, &owner_nsec);
+    git(
+        &["push", "--quiet", "origin", "main"],
+        &clone_member,
+        &owner_nsec,
+    );
+    git(
+        &["clone", "--quiet", &url, "clone-member-2"],
+        tmp.path(),
+        &owner_nsec,
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("clone-member-2").join("README.md")).unwrap(),
+        "private\n",
+        "member re-clone sees pushed content"
+    );
+
+    // An authenticated NON-member still cannot clone: after the challenge the
+    // relay answers the generic 404.
+    let stranger_nsec = Keys::generate().secret_key().to_bech32().unwrap();
+    let out = git_status(
+        &["clone", "--quiet", &url, "clone-stranger"],
+        tmp.path(),
+        &stranger_nsec,
+    );
+    assert!(
+        !out.status.success(),
+        "authenticated non-member clone of a private repo must fail"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires live relay + MinIO + git"]
 async fn git_concurrent_push_one_wins_and_repo_recovers() {
