@@ -257,11 +257,21 @@ fn workflow_query_results_are_deduplicated_by_event_id() {
 }
 
 #[test]
-fn channel_workflow_filters_reject_malformed_or_blank_channel_ids() {
-    for channel_id in ["not-a-uuid", "", "   "] {
-        let error = channel_workflow_filters(vec![channel_id.to_string()])
-            .expect_err("malformed channel id must fail before querying the relay");
-        assert_eq!(error, "invalid channel id");
+fn channel_workflow_filters_skip_malformed_or_blank_channel_ids() {
+    // One bad membership entry must not blank the whole Workflows overview:
+    // the invalid ids are skipped and the valid channels still get filters.
+    let valid = "33333333-3333-3333-3333-333333333333";
+    for bad in ["not-a-uuid", "", "   "] {
+        let filters = channel_workflow_filters(vec![bad.to_string(), valid.to_string()])
+            .expect("a non-UUID channel id is skipped, not fatal");
+        assert_eq!(filters.len(), 1, "only the valid channel gets a filter");
+        assert_eq!(
+            filters[0],
+            serde_json::json!({
+                "kinds": [30620],
+                "#h": [valid],
+            })
+        );
     }
 }
 

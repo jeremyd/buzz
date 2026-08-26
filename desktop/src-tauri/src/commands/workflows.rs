@@ -161,17 +161,27 @@ fn channel_workflow_filter_batches(channel_ids: Vec<String>) -> Result<Vec<Vec<V
 }
 
 fn channel_workflow_filters(channel_ids: Vec<String>) -> Result<Vec<Value>, String> {
-    channel_ids
+    Ok(channel_ids
         .into_iter()
-        .map(|channel_id| {
-            let channel_id = uuid::Uuid::parse_str(channel_id.trim())
-                .map_err(|_| "invalid channel id".to_string())?;
-            Ok(serde_json::json!({
-                "kinds": [30620],
-                "#h": [channel_id.to_string()],
-            }))
-        })
-        .collect()
+        .filter_map(
+            |channel_id| match uuid::Uuid::parse_str(channel_id.trim()) {
+                Ok(id) => Some(serde_json::json!({
+                    "kinds": [30620],
+                    "#h": [id.to_string()],
+                })),
+                Err(_) => {
+                    // A single non-UUID membership entry (legacy/imported channel)
+                    // must not blank the whole Workflows overview: skip it and keep
+                    // loading the valid channels.
+                    tracing::warn!(
+                        "buzz-desktop: get_channels_workflows: skipping non-UUID channel id {:?}",
+                        channel_id
+                    );
+                    None
+                }
+            },
+        )
+        .collect())
 }
 
 #[tauri::command]
