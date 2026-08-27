@@ -27,7 +27,7 @@ use std::{
 use buzz_ws_client_pkg::{NostrWsConnection, RelayMessage};
 use nostr::{Event, Keys};
 use tokio::{
-    sync::{mpsc, oneshot, Mutex},
+    sync::{mpsc, oneshot, watch, Mutex},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
@@ -40,6 +40,13 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(30);
 /// How long a read may block before the loop re-checks cancellation. Not a
 /// connection timeout: an idle relay is normal, so a lapsed read just loops.
 const READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a finite fetch waits for the session's socket to come up
+/// (connect + NIP-42 AUTH) before failing fast. The session loop connects in
+/// the background, so without this gate a fetch's request timer starts before
+/// the socket exists and cold-start fetches expire spuriously — the unread
+/// catch-up's 0-of-N failure mode. Sized to cover connect plus one reconnect
+/// backoff step; on expiry callers get a retryable error.
+const CONNECT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Backoff floor for reopening a subscription the relay CLOSED. Matches
 /// `RETRY_BASE_DELAY_MS` in `relayClosedRecovery.ts`.
 const CLOSED_RETRY_BASE_DELAY: Duration = Duration::from_secs(1);
@@ -235,6 +242,10 @@ pub(crate) struct RelaySession {
     archive_events: Arc<Mutex<Option<mpsc::Sender<MatchedEvent>>>>,
     wake: mpsc::Sender<()>,
     cancel: CancellationToken,
+    /// True while the session loop holds a connected, NIP-42-authenticated
+    /// socket. Flipped on by `run_session` after `connect_authenticated`
+    /// succeeds and off when that connection drops.
+    ready: watch::Sender<bool>,
 }
 
 struct PendingRequest {
@@ -303,6 +314,14 @@ impl RelaySession {
         filter: serde_json::Value,
         timeout: Duration,
     ) -> Result<Vec<Event>, String> {
+        // Gate on connection readiness first so `timeout` measures a live,
+        // authenticated relay rather than the background connect.
+        if !self.wait_until_ready(CONNECT_READY_TIMEOUT).await {
+            return Err(format!(
+                "relay connection not ready within {}s",
+                CONNECT_READY_TIMEOUT.as_secs()
+            ));
+        }
         let id = format!("native-fetch-{}", uuid::Uuid::new_v4());
         let (complete, result) = oneshot::channel();
         self.requests.lock().await.insert(
@@ -331,6 +350,32 @@ impl RelaySession {
         };
         self.finish_request(&id).await;
         outcome
+    }
+
+    /// Waits until the session's socket is connected and authenticated, or
+    /// `timeout` elapses. Returns `true` when ready, `false` on timeout or
+    /// session cancellation.
+    async fn wait_until_ready(&self, timeout: Duration) -> bool {
+        let mut ready = self.ready.subscribe();
+        if *ready.borrow() {
+            return true;
+        }
+        let became_ready = async {
+            loop {
+                if ready.changed().await.is_err() {
+                    return false;
+                }
+                if *ready.borrow() {
+                    return true;
+                }
+            }
+        };
+        tokio::select! {
+            _ = self.cancel.cancelled() => false,
+            outcome = tokio::time::timeout(timeout, became_ready) => {
+                outcome.unwrap_or(false)
+            }
+        }
     }
 
     async fn finish_request(&self, id: &str) {
@@ -396,12 +441,14 @@ pub(crate) async fn start(
 
 fn start_managed(relay_url: String, keys: Keys, auth_tag: Option<nostr::Tag>) -> Arc<RelaySession> {
     let (wake, wake_rx) = mpsc::channel(1);
+    let (ready, _) = watch::channel(false);
     let session = Arc::new(RelaySession {
         state: Arc::new(Mutex::new(SessionState::default())),
         requests: Arc::new(Mutex::new(HashMap::new())),
         archive_events: Arc::new(Mutex::new(None)),
         wake,
         cancel: CancellationToken::new(),
+        ready,
     });
 
     tauri::async_runtime::spawn(run_session(
@@ -435,7 +482,9 @@ async fn run_session(
                 // clean exit — a socket that drops after one event must not
                 // inherit the previous failure's delay.
                 delay = RECONNECT_BASE_DELAY;
+                let _ = session.ready.send_replace(true);
                 run_connection(conn, &session, &mut wake_rx).await;
+                let _ = session.ready.send_replace(false);
             }
             Err(error) => {
                 eprintln!("buzz-desktop: native_relay_client: connect failed: {error}");
