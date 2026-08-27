@@ -4201,8 +4201,7 @@ mod sec005_postgres_tests {
         // the repo doesn't exist. Existence masking is `authorize_git_read`'s
         // job and runs first (pinned by
         // `read_gate_challenges_anonymous_uniformly_for_missing_repos`).
-        let (state, pool) =
-            super::track_c_tests::finalize_test_state_with(true).await;
+        let (state, pool) = super::track_c_tests::finalize_test_state_with(true).await;
         let host = format!("sec005-nip43-{}.example", uuid::Uuid::new_v4().simple());
         let community = state
             .db
