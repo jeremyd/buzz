@@ -45,7 +45,9 @@ function seedCommunityStates(
 
 /**
  * Observe unread activity for INACTIVE communities without touching the active
- * relay singleton.
+ * relay singleton. `markCommunityRead` works for ANY community (including the
+ * active one) — it publishes read-now markers over a short-lived observer
+ * connection, never the active relay session.
  */
 export function useCommunityUnread(
   communities: Community[],
@@ -160,23 +162,26 @@ export function useCommunityUnread(
   const communitiesRef = React.useRef(communities);
   communitiesRef.current = communities;
 
-  const markRead = React.useCallback(
-    async (communityId: string) => {
-      const community = communitiesRef.current.find(
-        (candidate) => candidate.id === communityId,
-      );
-      if (!community || communityId === activeCommunityId) return;
+  const markRead = React.useCallback(async (communityId: string) => {
+    const community = communitiesRef.current.find(
+      (candidate) => candidate.id === communityId,
+    );
+    if (!community) return;
 
-      const { pubkey } = await getIdentity();
-      await markCommunityRead(community, pubkey);
-      // Optimistic clear — the next poll re-verifies against the relay.
-      setUnreadByCommunity((previous) => ({
-        ...previous,
-        [communityId]: { hasUnread: false, state: "ready" },
-      }));
-    },
-    [activeCommunityId],
-  );
+    const { pubkey } = await getIdentity();
+    // Publishes read-now markers for every observed channel — including for
+    // the ACTIVE community: the local mark-all only covers channels the
+    // client observed, so the relay-side markers must advance past messages
+    // a failed catch-up never surfaced or the switcher badge re-lights on
+    // the first poll after switching away. Grow-only max-merge semantics
+    // make the extra publish safe for markers already further ahead.
+    await markCommunityRead(community, pubkey);
+    // Optimistic clear — the next poll re-verifies against the relay.
+    setUnreadByCommunity((previous) => ({
+      ...previous,
+      [communityId]: { hasUnread: false, state: "ready" },
+    }));
+  }, []);
 
   return { unreadByCommunity, markCommunityRead: markRead };
 }

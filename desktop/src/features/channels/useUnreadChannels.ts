@@ -72,6 +72,11 @@ type UseUnreadChannelsOptions = UseLiveChannelUpdatesOptions & {
 // filter to find one external trigger message. 1000 matches the live sub's
 // per-channel limit elsewhere in the app.
 const CATCH_UP_LIMIT = 1000;
+// Backoff schedule for retrying failed catch-up batches/channels: released
+// claims alone don't re-fire the effect until an unrelated dependency changes,
+// which in practice meant a lost race killed catch-up for the whole session.
+const CATCH_UP_RETRY_BASE_MS = 5_000;
+const CATCH_UP_MAX_RETRIES = 5;
 const EMPTY_ROOT_IDS: ReadonlySet<string> = new Set();
 
 export function channelCatchUpEventKinds(
@@ -205,6 +210,18 @@ export function useUnreadChannels(
   // letting newly-joined channels be caught up. Reset on identity change.
   const caughtUpChannelsRef = React.useRef(new Set<string>());
 
+  // Re-fires the catch-up effect after a backoff when claims were released by
+  // a failure — otherwise released channels wait for an unrelated dependency
+  // change that may never come.
+  const [catchUpRetryNonce, bumpCatchUpRetryNonce] = React.useReducer(
+    (x: number) => x + 1,
+    0,
+  );
+  const catchUpRetryRef = React.useRef<{
+    attempts: number;
+    timer: number | null;
+  }>({ attempts: 0, timer: null });
+
   const [latestVersion, bumpLatestVersion] = React.useReducer(
     (x: number) => x + 1,
     0,
@@ -228,6 +245,11 @@ export function useUnreadChannels(
     // store — another device's data should survive identity switches here).
     forcedUnreadRef.current = pubkey ? forcedUnreadStore.read(pubkey) : {};
     caughtUpChannelsRef.current = new Set();
+    catchUpRetryRef.current.attempts = 0;
+    if (catchUpRetryRef.current.timer !== null) {
+      window.clearTimeout(catchUpRetryRef.current.timer);
+      catchUpRetryRef.current.timer = null;
+    }
     participatedRootIdsRef.current = pubkey
       ? participationStore.read(pubkey)
       : new Set();
@@ -619,7 +641,7 @@ export function useUnreadChannels(
   // NIP-RS read marker?" If yes, advance latestByChannelRef so the unread
   // predicate fires. This is the only way historical unreads survive an
   // app restart now that we don't persist any client-side "latest" state.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: options.followedRootIds intentionally omitted — it's a Set reference that changes identity every render; the catch-up is a one-shot per-channel operation controlled by caughtUpChannelsRef, not reactive to follow changes
+  // biome-ignore lint/correctness/useExhaustiveDependencies: options.followedRootIds intentionally omitted — it's a Set reference that changes identity every render; the catch-up is a one-shot per-channel operation controlled by caughtUpChannelsRef, not reactive to follow changes. catchUpRetryNonce is intentionally extra: it re-fires the effect after a failure released claims.
   React.useEffect(() => {
     if (!isReadStateReady) return;
     if (!relayClient) return;
@@ -639,6 +661,21 @@ export function useUnreadChannels(
     }
 
     let isCancelled = false;
+
+    const scheduleCatchUpRetry = () => {
+      const retry = catchUpRetryRef.current;
+      if (retry.attempts >= CATCH_UP_MAX_RETRIES || retry.timer !== null) {
+        return;
+      }
+      retry.attempts += 1;
+      retry.timer = window.setTimeout(
+        () => {
+          retry.timer = null;
+          bumpCatchUpRetryNonce();
+        },
+        CATCH_UP_RETRY_BASE_MS * 2 ** (retry.attempts - 1),
+      );
+    };
 
     // Snapshot membership sizes so the `.then` can detect whether the catch-up
     // discovered new participated/authored/mentioned roots (pass 1 mutates the
@@ -671,16 +708,30 @@ export function useUnreadChannels(
         if (isCancelled) return;
         // The command rejects if relay/pubkey scope changes in flight. Keep the
         // renderer fence too: it also covers effect cleanup before merge.
-        if (!observedPersistence.isScopeLoaded()) return;
+        // Release the batch's claims on rejection — holding them here used to
+        // kill catch-up for the rest of the session after one lost race.
+        if (!observedPersistence.isScopeLoaded()) {
+          console.warn(
+            "[unread-catch-up] scope not loaded at merge — dropping batch, will retry",
+          );
+          for (const id of toFetch) caughtUpChannelsRef.current.delete(id);
+          scheduleCatchUpRetry();
+          return;
+        }
 
         let didAdvance = false;
         let didDiscover = false;
+        let hadChannelError = false;
         const allThreadReplies: ThreadActivityItem[] = [];
         for (const result of results) {
           if (result.status === "error") {
+            console.warn(
+              `[unread-catch-up] channel ${result.channelId} failed: ${result.error}`,
+            );
             // The error arm carries only this identity; releasing its claim is
             // what lets a failed channel retry on the next effect run.
             caughtUpChannelsRef.current.delete(result.channelId);
+            hadChannelError = true;
             continue;
           }
           for (const rootId of result.discovered.participated) {
@@ -759,10 +810,17 @@ export function useUnreadChannels(
         ) {
           bumpMembershipVersion();
         }
+        if (hadChannelError) {
+          scheduleCatchUpRetry();
+        } else {
+          catchUpRetryRef.current.attempts = 0;
+        }
       })
-      .catch(() => {
+      .catch((error) => {
         if (isCancelled) return;
+        console.warn("[unread-catch-up] batch failed:", error);
         for (const id of toFetch) caughtUpChannelsRef.current.delete(id);
+        scheduleCatchUpRetry();
       });
 
     return () => {
@@ -773,8 +831,16 @@ export function useUnreadChannels(
       for (const id of toFetch) {
         caughtUpChannelsRef.current.delete(id);
       }
+      // A pending retry is redundant once a new run re-attempts unclaimed
+      // channels; .then/.catch guard on isCancelled, so nothing re-schedules
+      // after this point.
+      if (catchUpRetryRef.current.timer !== null) {
+        window.clearTimeout(catchUpRetryRef.current.timer);
+        catchUpRetryRef.current.timer = null;
+      }
     };
   }, [
+    catchUpRetryNonce,
     channelIdsKey,
     getEffectiveTimestamp,
     isReadStateReady,

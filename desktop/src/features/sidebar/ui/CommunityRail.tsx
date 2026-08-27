@@ -17,6 +17,7 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { CheckCheck, Link2, Plus, Settings2, Ticket } from "lucide-react";
 import * as React from "react";
+import { toast } from "sonner";
 
 import type { Community } from "@/features/communities/types";
 import { EditCommunityDialog } from "@/features/communities/ui/EditCommunityDialog";
@@ -361,13 +362,20 @@ export function CommunityRail({
   const handleMarkAllRead = (community: Community) => {
     if (community.id === activeCommunityId) {
       markAllChannelsRead();
-      return;
     }
+    // Always publish relay-side markers too (even for the active community):
+    // the switcher badge is computed from the relay, so it must clear even
+    // for messages the local observed store never saw (e.g. after a failed
+    // catch-up).
     markCommunityRead(community.id).catch((error) => {
       console.warn(
         `[CommunityRail] mark all read failed community=${community.id}:`,
         error,
       );
+      toast.error("Couldn't mark community as read", {
+        description:
+          "The community's relay didn't accept the update — try again.",
+      });
     });
   };
 
