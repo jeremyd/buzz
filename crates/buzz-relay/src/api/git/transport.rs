@@ -88,7 +88,8 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
 
         // Relay membership gate (NIP-43). Enforced here for writes
         // (receive-pack). Reads apply the equivalent gate inside
-        // `authorize_git_read` so a repo marked public can short-circuit it.
+        // `enforce_read_relay_membership` so a repo marked public can
+        // short-circuit it.
         if crate::api::relay_members::enforce_relay_membership(
             state,
             tenant.community(),
@@ -99,8 +100,9 @@ impl axum::extract::FromRequestParts<Arc<AppState>> for GitAuth {
         .await
         .is_err()
         {
-            warn!(pubkey = %pubkey.to_hex(), "git: relay membership denied");
-            return Err((StatusCode::FORBIDDEN, "restricted: not a relay member").into_response());
+            warn_relay_membership_denied(state, tenant.community(), &pubkey, auth_tag.as_deref())
+                .await;
+            return Err(relay_membership_denial());
         }
 
         deny_banned_git_principal(
@@ -278,6 +280,52 @@ async fn bind_git_tenant(
     crate::tenant::bind_community(&state.db, raw_host)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "repository not found").into_response())
+}
+
+/// Denial for a caller that authenticated but is not admitted by the
+/// relay-membership (NIP-43) gate.
+///
+/// One constructor shared by the write extractor ([`GitAuth`]) and the read
+/// gate ([`enforce_read_relay_membership`]) so the two responses cannot
+/// drift: the caller's membership status is the same fact on both paths, and
+/// reporting it as 403 on one and a masked 404 on the other tells an
+/// authorized-but-unadmitted caller their repo doesn't exist.
+fn relay_membership_denial() -> Response {
+    (StatusCode::FORBIDDEN, "restricted: not a relay member").into_response()
+}
+
+/// Emit the relay-membership denial warning, diagnosing the most common
+/// cause inline: a delegated agent credential that arrived without its
+/// NIP-OA auth tag. Membership for agents is proven per request by that tag
+/// (the persisted `users.agent_owner_pubkey` mapping is not consulted by the
+/// gate), so "owner on file, no tag presented" pinpoints a signer that lost
+/// `BUZZ_AUTH_TAG`. The owner lookup runs only on this denial path.
+async fn warn_relay_membership_denied(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    pubkey: &nostr::PublicKey,
+    auth_tag: Option<&str>,
+) {
+    let owner_on_file = match state
+        .db
+        .get_agent_channel_policy(community, pubkey.as_bytes())
+        .await
+    {
+        Ok(Some((_, Some(owner)))) => Some(hex::encode(owner)),
+        Ok(_) | Err(_) => None,
+    };
+    match (&owner_on_file, auth_tag) {
+        (Some(owner), None) => warn!(
+            pubkey = %pubkey.to_hex(),
+            owner_on_file = %owner,
+            "git: relay membership denied — caller has a NIP-OA owner on file but presented no auth tag (signer missing BUZZ_AUTH_TAG?)"
+        ),
+        _ => warn!(
+            pubkey = %pubkey.to_hex(),
+            auth_tag_presented = auth_tag.is_some(),
+            "git: relay membership denied"
+        ),
+    }
 }
 
 /// Build the 401 response carrying the `WWW-Authenticate: Nostr ...` challenge.
@@ -698,9 +746,15 @@ async fn authorize_git_read(
 ///
 /// Public repos skip it entirely for clone/fetch; authenticated access to a
 /// private repo — and the receive-pack advertisement regardless of visibility
-/// — enforces it, preserving the behavior that previously lived in the
-/// [`GitAuth`] extractor. Denials return the generic 404 so membership can't
-/// be probed.
+/// — enforces it, preserving the check that previously lived in the
+/// [`GitAuth`] extractor. The denial is the same 403 the write path returns,
+/// NOT the generic 404: masking membership here buys no secrecy (the
+/// receive-pack POST reveals the identical 403 to the identical caller) and
+/// misreports an authorization failure as a missing repo. Existence stays
+/// unprobeable because [`authorize_git_read`] runs first and 404s both
+/// nonexistent repos and private repos the caller has no channel access to —
+/// this gate is only reached by callers already entitled to know the repo
+/// exists (public repo, or an authenticated channel member).
 async fn enforce_read_relay_membership(
     state: &Arc<AppState>,
     auth: &OptionalGitAuth,
@@ -723,8 +777,14 @@ async fn enforce_read_relay_membership(
         .await
         .is_err()
         {
-            warn!(pubkey = %pubkey.to_hex(), "git: relay membership denied");
-            return Err((StatusCode::NOT_FOUND, "repository not found").into_response());
+            warn_relay_membership_denied(
+                state,
+                auth.tenant.community(),
+                pubkey,
+                auth.auth_tag.as_deref(),
+            )
+            .await;
+            return Err(relay_membership_denial());
         }
     }
     Ok(())
@@ -2484,9 +2544,18 @@ mod track_c_tests {
     }
 
     async fn finalize_test_state() -> (Arc<AppState>, sqlx::PgPool) {
+        finalize_test_state_with(false).await
+    }
+
+    /// Full `AppState` against the test Postgres, with the NIP-43
+    /// relay-membership gate toggled per test. Also used by the sec005 read
+    /// gate tests, which exercise the members-only denial shape.
+    pub(super) async fn finalize_test_state_with(
+        require_relay_membership: bool,
+    ) -> (Arc<AppState>, sqlx::PgPool) {
         const TEST_DB_URL: &str = "postgres://buzz:buzz_dev@localhost:5432/buzz"; // sadscan:disable np.postgres.1
         let mut config = crate::config::Config::from_env().expect("default config loads");
-        config.require_relay_membership = false;
+        config.require_relay_membership = require_relay_membership;
         config.redis_url = "redis://127.0.0.1:1".to_string();
         config.database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
@@ -2894,6 +2963,20 @@ mod track_c_tests {
             .to_str()
             .unwrap();
         assert_eq!(header, "Nostr realm=\"buzz\", method=\"GET\"");
+    }
+
+    /// The relay-membership denial must be the write path's 403, never a
+    /// 404: a masked "repository not found" for an authorization failure
+    /// sends a correctly-authenticated caller debugging repo existence
+    /// instead of their credential.
+    #[tokio::test]
+    async fn relay_membership_denial_is_403_with_write_path_body() {
+        let resp = relay_membership_denial();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read body");
+        assert_eq!(&bytes[..], b"restricted: not a relay member");
     }
 
     /// A gzip-encoded request body is transparently inflated before it
@@ -4107,5 +4190,59 @@ mod sec005_postgres_tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(body, GENERIC_DENIAL);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn read_gate_relay_membership_denial_is_403_not_masked_404() {
+        // On a members-only relay, an authenticated caller that clears
+        // `authorize_git_read` (public repo, or channel member) but fails the
+        // NIP-43 gate must get the write path's 403 — not a 404 that claims
+        // the repo doesn't exist. Existence masking is `authorize_git_read`'s
+        // job and runs first (pinned by
+        // `read_gate_challenges_anonymous_uniformly_for_missing_repos`).
+        let (state, pool) =
+            super::track_c_tests::finalize_test_state_with(true).await;
+        let host = format!("sec005-nip43-{}.example", uuid::Uuid::new_v4().simple());
+        let community = state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community")
+            .id;
+        let tenant = buzz_core::TenantContext::resolved(community, host);
+
+        let outsider = Keys::generate().public_key();
+        let auth = OptionalGitAuth {
+            pubkey: Some(outsider),
+            auth_tag: None,
+            signed_auth_created_at: None,
+            tenant: tenant.clone(),
+        };
+        let (status, body) = denial_parts(
+            enforce_read_relay_membership(&state, &auth, GitReadAccess::Authenticated).await,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body, "restricted: not a relay member");
+
+        // The identical caller as a relay member passes the gate.
+        state
+            .db
+            .add_relay_member(community, &outsider.to_hex(), "member", None)
+            .await
+            .expect("admit member");
+        let auth = OptionalGitAuth {
+            pubkey: Some(outsider),
+            auth_tag: None,
+            signed_auth_created_at: None,
+            tenant,
+        };
+        enforce_read_relay_membership(&state, &auth, GitReadAccess::Authenticated)
+            .await
+            .expect("relay member read passes the NIP-43 gate");
+
+        drop(state);
+        pool.close().await;
     }
 }
