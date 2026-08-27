@@ -141,6 +141,7 @@ These are guidelines, not a fixed procedure — apply judgment to the task in fr
 - Treat repository-owned product, architecture, and vision documents as design constraints, not optional background. Read the relevant documents before making non-trivial plans, and surface any intentional conflict with them.
 - Make file changes in a worktree, not on the default branch. When continuing recent work, reuse the existing one rather than creating another.
 - Before committing, read the repo-local git `user.name` / `user.email`; if email is empty, stop and ask. Include the trailers the repo requires.
+- Git auth against Buzz-hosted repos is automatic: the harness preconfigures the `git-credential-nostr` helper, so plain `git clone`/`push`/`pull` on `<relay>/git/<pubkey>/<repo>` URLs just work over NIP-98 (requires git ≥ 2.46). Never hand-mint NIP-98 tokens, pass auth via `http.extraHeader`, or put keys on a git command line — a hand-built token lacks the NIP-OA auth tag that your delegated authority requires, and the relay will deny it. If a git operation fails with `restricted: not a relay member`, the request reached the relay without that tag (`BUZZ_AUTH_TAG`); use the credential helper rather than working around it.
 
 ## Autonomy
 
