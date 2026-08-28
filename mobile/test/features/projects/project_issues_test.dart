@@ -1,6 +1,7 @@
 // Port of desktop projectIssues.test.mjs (read-path subset).
 import 'package:flutter_test/flutter_test.dart';
 import 'package:buzz/features/projects/project_issues.dart';
+import 'package:buzz/features/projects/project_issue_mutations.dart';
 import 'package:buzz/shared/relay/relay.dart';
 
 NostrEvent _event({
@@ -582,6 +583,78 @@ void main() {
       );
       final merged = mergeEventsById([a, b], [a, b]);
       expect(merged.map((event) => event.id).toList(), ['dup', 'unique']);
+    });
+  });
+
+  group('buildGitIssueTags', () {
+    test('builds repository-scoped issue creation tags', () {
+      expect(
+        buildGitIssueTags(
+          repoAddress: repoAddress,
+          repoOwner: owner,
+          title: '  Fix the broken workflow  ',
+        ),
+        [
+          ['a', repoAddress],
+          ['p', owner],
+          ['subject', 'Fix the broken workflow'],
+        ],
+      );
+    });
+
+    test('rejects non-30617 repos, bad owners, and bad titles', () {
+      expect(
+        () => buildGitIssueTags(
+          repoAddress: '30621:$owner:x',
+          repoOwner: owner,
+          title: 'T',
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => buildGitIssueTags(
+          repoAddress: repoAddress,
+          repoOwner: 'short',
+          title: 'T',
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => buildGitIssueTags(
+          repoAddress: repoAddress,
+          repoOwner: owner,
+          title: '   ',
+        ),
+        throwsArgumentError,
+      );
+      expect(
+        () => buildGitIssueTags(
+          repoAddress: repoAddress,
+          repoOwner: owner,
+          title: 'x' * 257,
+        ),
+        throwsArgumentError,
+      );
+    });
+  });
+
+  group('nextProjectIssueCommentCreatedAt', () {
+    test('orders consecutive same-author comments across whole seconds', () {
+      final comment = _event(
+        kind: 1,
+        pubkey: author,
+        createdAt: 200,
+        id: 'comment-1',
+        content: 'First',
+        tags: [
+          ['e', 'e' * 64, '', 'root'],
+        ],
+      );
+      final issue = eventToProjectIssue(issueEvent(), commentEvents: [comment]);
+      expect(nextProjectIssueCommentCreatedAt(issue, 150, author), 201);
+      expect(nextProjectIssueCommentCreatedAt(issue, 500, author), 500);
+      // Other authors' comments do not constrain this author.
+      expect(nextProjectIssueCommentCreatedAt(issue, 150, owner), 150);
     });
   });
 }

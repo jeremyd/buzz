@@ -11,12 +11,14 @@ import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
+import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/bee_refresh_indicator.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
 import 'project_models.dart';
 import 'project_issues.dart';
+import 'project_issue_mutations.dart';
 import 'projects_provider.dart';
 
 class ProjectsPage extends HookConsumerWidget {
@@ -265,6 +267,28 @@ class _RepositoryIssuesPage extends HookConsumerWidget {
   final ProjectRepository repository;
   final VoidCallback onBack;
 
+  void _showCreateTaskSheet(BuildContext context, WidgetRef ref) {
+    final nsec = ref.read(relayConfigProvider).nsec?.trim();
+    if (nsec == null || nsec.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No signing key configured.')),
+      );
+      return;
+    }
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      builder: (sheetContext) => _CreateTaskSheet(
+        repository: repository,
+        nsec: nsec,
+        onCreated: () {
+          ref.invalidate(repoIssuesProvider(repository.repoAddress));
+        },
+        ref: ref,
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final issuesAsync = ref.watch(repoIssuesProvider(repository.repoAddress));
@@ -279,6 +303,10 @@ class _RepositoryIssuesPage extends HookConsumerWidget {
             fontWeight: FontWeight.w600,
           ),
         ),
+      ),
+      floatingActionButton: FloatingActionButton(
+        onPressed: () => _showCreateTaskSheet(context, ref),
+        child: const Icon(LucideIcons.plus300),
       ),
       body: issuesAsync.when(
         data: (issues) => BeeRefreshIndicator(
@@ -346,6 +374,122 @@ class _IssueTile extends StatelessWidget {
         style: context.textTheme.bodySmall?.copyWith(
           color: context.colors.onSurfaceVariant,
         ),
+      ),
+    );
+  }
+}
+
+class _CreateTaskSheet extends StatefulWidget {
+  const _CreateTaskSheet({
+    required this.repository,
+    required this.nsec,
+    required this.onCreated,
+    required this.ref,
+  });
+
+  final ProjectRepository repository;
+  final String nsec;
+  final VoidCallback onCreated;
+  final WidgetRef ref;
+
+  @override
+  State<_CreateTaskSheet> createState() => _CreateTaskSheetState();
+}
+
+class _CreateTaskSheetState extends State<_CreateTaskSheet> {
+  final _titleController = TextEditingController();
+  final _bodyController = TextEditingController();
+  bool _submitting = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _titleController.dispose();
+    _bodyController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final title = _titleController.text.trim();
+    if (title.isEmpty || _submitting) return;
+    setState(() {
+      _submitting = true;
+      _error = null;
+    });
+    try {
+      final session = widget.ref.read(relaySessionProvider.notifier);
+      final signedRelay = SignedEventRelay(session: session, nsec: widget.nsec);
+      await publishProjectIssue(
+        signedRelay,
+        repoAddress: widget.repository.repoAddress,
+        repoOwner: widget.repository.owner,
+        title: title,
+        body: _bodyController.text,
+      );
+      widget.onCreated();
+      if (mounted) Navigator.of(context).pop();
+    } catch (error) {
+      setState(() {
+        _submitting = false;
+        _error = 'Failed to create task: $error';
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(
+        left: Grid.gutter,
+        right: Grid.gutter,
+        top: Grid.md,
+        bottom: MediaQuery.viewInsetsOf(context).bottom + Grid.md,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Text('New task', style: context.textTheme.titleMedium),
+          const SizedBox(height: Grid.sm),
+          TextField(
+            controller: _titleController,
+            autofocus: true,
+            maxLength: 256,
+            decoration: const InputDecoration(
+              labelText: 'Title',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          const SizedBox(height: Grid.sm),
+          TextField(
+            controller: _bodyController,
+            maxLines: 4,
+            decoration: const InputDecoration(
+              labelText: 'Description (optional)',
+              border: OutlineInputBorder(),
+            ),
+          ),
+          if (_error != null) ...[
+            const SizedBox(height: Grid.sm),
+            Text(
+              _error!,
+              style: context.textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.error,
+              ),
+            ),
+          ],
+          const SizedBox(height: Grid.md),
+          FilledButton(
+            onPressed: _submitting ? null : _submit,
+            child: _submitting
+                ? const SizedBox(
+                    height: 18,
+                    width: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Text('Create task'),
+          ),
+        ],
       ),
     );
   }

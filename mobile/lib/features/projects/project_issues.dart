@@ -59,6 +59,9 @@ class ProjectIssue {
   final List<String> labels;
   final List<String> recipients;
   final List<String> assignees;
+
+  /// Per-assignee head operation id for causal self-service ops.
+  final Map<String, String> assigneeOperationHeads;
   final String status;
   final String? statusEventId;
   final int updatedAt;
@@ -76,6 +79,7 @@ class ProjectIssue {
     required this.labels,
     required this.recipients,
     required this.assignees,
+    required this.assigneeOperationHeads,
     required this.status,
     required this.statusEventId,
     required this.updatedAt,
@@ -167,7 +171,8 @@ String _statusFromEvent(NostrEvent issue, NostrEvent? statusEvent) {
 
 class _AssignmentState {
   final List<String> assignees;
-  const _AssignmentState(this.assignees);
+  final Map<String, String> heads;
+  const _AssignmentState(this.assignees, this.heads);
 }
 
 /// Assignment state reduced from trusted kind:1 operations
@@ -256,7 +261,7 @@ _AssignmentState _assignmentStateForIssue(
       operationHeads[pubkey] = operation.id;
     }
   }
-  return _AssignmentState(assignees.toList());
+  return _AssignmentState(assignees.toList(), Map.of(operationHeads));
 }
 
 class _AssignmentOperation {
@@ -331,6 +336,7 @@ ProjectIssue eventToProjectIssue(
     labels: labels,
     recipients: _allTags(issue, 'p'),
     assignees: assignmentState.assignees,
+    assigneeOperationHeads: assignmentState.heads,
     status: _statusFromEvent(issue, latestStatus),
     statusEventId: latestStatus?.id,
     updatedAt: updatedAt,
