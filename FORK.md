@@ -9,7 +9,7 @@ artifacts are versioned.
 
 | Remote | URL | Purpose |
 |--------|-----|---------|
-| `origin` | `ssh://git@code.relay.tools:2222/forks/buzz.git` | The fork (GitLab) — `main` is the published branch |
+| `origin` | `https://code.relay.tools/forks/buzz.git` | The fork (GitLab) — `main` is the published branch |
 | `block` | `github.com/block/buzz` | Upstream |
 | `jeremyd` | `github.com/jeremyd/buzz` | GitHub fork used for upstream PRs |
 
