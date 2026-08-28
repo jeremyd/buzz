@@ -10,6 +10,77 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/relay/relay.dart';
 import 'project_models.dart';
+import 'project_issues.dart';
+
+/// Query the relay HTTP bridge with a websocket fallback for one filter.
+Future<List<NostrEvent>> relayFetch(
+  RelaySessionNotifier session,
+  NostrFilter filter,
+) async {
+  try {
+    return await session.queryRelay([filter]);
+  } catch (_) {
+    return await session.fetchHistory(filter);
+  }
+}
+
+/// Loads issues (and their aggregate context events) for one repository,
+/// mirroring desktop `fetchProjectsWorkItems` scoped to a single repo.
+Future<RepoIssuesResult> fetchRepoIssues(
+  RelayFetch fetch,
+  String repoAddress,
+) async {
+  final rootEvents = await fetch(
+    NostrFilter(
+      kinds: [kindGitIssue],
+      tags: {
+        '#a': [repoAddress],
+      },
+      limit: 2000,
+    ),
+  );
+  final results = await Future.wait([
+    fetch(
+      NostrFilter(
+        kinds: [1],
+        tags: {
+          '#a': [repoAddress],
+        },
+        limit: 2000,
+      ),
+    ),
+    fetch(
+      NostrFilter(
+        kinds: [
+          kindGitStatusOpen,
+          kindGitStatusMerged,
+          kindGitStatusClosed,
+          kindGitStatusDraft,
+        ],
+        tags: {
+          '#a': [repoAddress],
+        },
+        limit: 2000,
+      ),
+    ),
+    fetchAssignmentOperationEvents(fetch, [
+      for (final event in rootEvents) event.id,
+    ]),
+  ]);
+  final commentEvents = mergeEventsById(results[0], results[2]);
+  final statusEvents = results[1];
+
+  return RepoIssuesResult(
+    issues: projectIssueEventsToIssues(
+      issueEvents: rootEvents,
+      statusEvents: statusEvents,
+      commentEvents: commentEvents,
+    ),
+    rootEvents: rootEvents,
+    commentEvents: commentEvents,
+    statusEvents: statusEvents,
+  );
+}
 
 const _kindDeletion = 5;
 const _kindRepoAnnouncement = 30617;
@@ -92,3 +163,17 @@ class ProjectsNotifier extends AsyncNotifier<List<Project>> {
 final projectsProvider = AsyncNotifierProvider<ProjectsNotifier, List<Project>>(
   ProjectsNotifier.new,
 );
+
+/// Issues for a single repository (kind:1621 + statuses + comments).
+/// Re-fetches on refresh via `ref.invalidate(repoIssuesProvider(repoAddress))`.
+final repoIssuesProvider = FutureProvider.family<List<ProjectIssue>, String>((
+  ref,
+  repoAddress,
+) async {
+  final session = ref.read(relaySessionProvider.notifier);
+  final result = await fetchRepoIssues(
+    (filter) => relayFetch(session, filter),
+    repoAddress,
+  );
+  return result.issues;
+});

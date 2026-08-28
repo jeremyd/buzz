@@ -16,6 +16,7 @@ import '../../shared/widgets/bee_refresh_indicator.dart';
 import '../../shared/widgets/frosted_app_bar.dart';
 import '../../shared/widgets/frosted_scaffold.dart';
 import 'project_models.dart';
+import 'project_issues.dart';
 import 'projects_provider.dart';
 
 class ProjectsPage extends HookConsumerWidget {
@@ -169,14 +170,28 @@ class _ProjectCard extends StatelessWidget {
   }
 }
 
-class _ProjectDetailPage extends StatelessWidget {
+class _ProjectDetailPage extends HookConsumerWidget {
   const _ProjectDetailPage({required this.project, required this.onBack});
 
   final Project project;
   final VoidCallback onBack;
 
   @override
-  Widget build(BuildContext context) {
+  Widget build(BuildContext context, WidgetRef ref) {
+    final selectedRepoAddress = useState<String?>(null);
+    final selectedRepository = project.repositories
+        .where(
+          (repository) => repository.repoAddress == selectedRepoAddress.value,
+        )
+        .firstOrNull;
+
+    if (selectedRepository != null) {
+      return _RepositoryIssuesPage(
+        repository: selectedRepository,
+        onBack: () => selectedRepoAddress.value = null,
+      );
+    }
+
     return FrostedScaffold(
       appBar: FrostedAppBar(
         leading: BackButton(onPressed: onBack),
@@ -214,6 +229,7 @@ class _ProjectDetailPage extends StatelessWidget {
           else
             for (final repository in project.repositories)
               ListTile(
+                onTap: () => selectedRepoAddress.value = repository.repoAddress,
                 leading: const Icon(LucideIcons.gitBranch300),
                 title: Text(repository.name),
                 subtitle: Text(
@@ -224,6 +240,7 @@ class _ProjectDetailPage extends StatelessWidget {
                     color: context.colors.onSurfaceVariant,
                   ),
                 ),
+                trailing: const Icon(LucideIcons.chevronRight300),
               ),
           if (project.unavailableRepositoryAddresses.isNotEmpty)
             ListTile(
@@ -237,6 +254,98 @@ class _ProjectDetailPage extends StatelessWidget {
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+class _RepositoryIssuesPage extends HookConsumerWidget {
+  const _RepositoryIssuesPage({required this.repository, required this.onBack});
+
+  final ProjectRepository repository;
+  final VoidCallback onBack;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final issuesAsync = ref.watch(repoIssuesProvider(repository.repoAddress));
+
+    return FrostedScaffold(
+      appBar: FrostedAppBar(
+        leading: BackButton(onPressed: onBack),
+        title: Text(
+          repository.name,
+          style: context.textTheme.titleMedium?.copyWith(
+            fontSize: 20,
+            fontWeight: FontWeight.w600,
+          ),
+        ),
+      ),
+      body: issuesAsync.when(
+        data: (issues) => BeeRefreshIndicator(
+          onRefresh: () async {
+            ref.invalidate(repoIssuesProvider(repository.repoAddress));
+            await ref.read(repoIssuesProvider(repository.repoAddress).future);
+          },
+          child: issues.isEmpty
+              ? ListView(
+                  children: const [
+                    SizedBox(height: 120),
+                    Center(child: Text('No tasks yet.')),
+                  ],
+                )
+              : ListView.builder(
+                  itemCount: issues.length,
+                  itemBuilder: (context, index) {
+                    final issue = issues[index];
+                    return _IssueTile(issue: issue);
+                  },
+                ),
+        ),
+        error: (error, stackTrace) => _ProjectsError(
+          error: error,
+          onRetry: () =>
+              ref.invalidate(repoIssuesProvider(repository.repoAddress)),
+        ),
+        loading: () => const Center(child: CircularProgressIndicator()),
+      ),
+    );
+  }
+}
+
+class _IssueTile extends StatelessWidget {
+  const _IssueTile({required this.issue});
+
+  final ProjectIssue issue;
+
+  @override
+  Widget build(BuildContext context) {
+    final statusColor = switch (issue.status) {
+      ProjectIssueStatus.done => context.colors.primary,
+      ProjectIssueStatus.closed => context.colors.onSurfaceVariant,
+      ProjectIssueStatus.inProgress ||
+      ProjectIssueStatus.inReview => context.colors.tertiary,
+      _ => context.colors.onSurfaceVariant,
+    };
+    return ListTile(
+      leading: Icon(LucideIcons.circleDot300, color: statusColor),
+      title: Text(
+        issue.title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: context.textTheme.titleSmall,
+      ),
+      subtitle: Text(
+        [
+          issue.status,
+          if (issue.comments.isNotEmpty) '${issue.comments.length} comments',
+          if (issue.assignees.isNotEmpty) '${issue.assignees.length} assigned',
+          if (issue.labels.isNotEmpty) ...issue.labels.take(3),
+        ].join(' · '),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: context.textTheme.bodySmall?.copyWith(
+          color: context.colors.onSurfaceVariant,
+        ),
       ),
     );
   }
