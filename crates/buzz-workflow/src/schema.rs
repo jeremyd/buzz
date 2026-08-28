@@ -68,6 +68,19 @@ pub enum TriggerDef {
     },
     /// Fires when HTTP POST arrives at `/hooks/{id}`.
     Webhook,
+    /// Fires when a trusted NIP-34 issue assignment operation lands.
+    ///
+    /// An assignment operation is a kind:1 comment carrying
+    /// `e: <issue> root` + `a: <repo>` + `p: <assignee>` tags and a
+    /// `t: assignment` label. It only fires when the operation signer is
+    /// the issue author or the repository owner, or it is a self-assignment
+    /// (sole assignee == signer) — the same trust rules readers apply
+    /// (see `buzz_sdk::builders`).
+    IssueAssigned {
+        /// Optional evalexpr filter (e.g. `trigger_assignee == "..."`).
+        #[serde(default)]
+        filter: Option<String>,
+    },
 }
 
 /// A single step in a workflow definition.
@@ -234,7 +247,7 @@ impl WorkflowDef {
                     return Err(WorkflowError::InvalidDefinition(format!(
                         "step '{}': reply_in_thread requires a message-based trigger \
                          (message_posted, reaction_added, or diff_posted); \
-                         schedule and webhook triggers have no message to reply to",
+                         schedule, webhook, and issue_assigned triggers have no message to reply to",
                         step.id
                     )));
                 }
@@ -357,6 +370,76 @@ mod tests {
             }
             other => panic!("unexpected trigger: {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_issue_assigned_trigger() {
+        let yaml = concat!(
+            "name: Auto Start Task\n",
+            "trigger:\n",
+            "  on: issue_assigned\n",
+            "  filter: 'str_contains(trigger_repo_id, \"buzz-zzub\")'\n",
+            "steps:\n",
+            "  - id: ping\n",
+            "    action: send_message\n",
+            "    text: 'Assigned: {{trigger.issue_title}}'\n",
+        );
+        let (def, json) = parse_yaml(yaml).expect("parse failed");
+        match &def.trigger {
+            TriggerDef::IssueAssigned { filter } => {
+                assert!(filter
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("trigger_repo_id"));
+            }
+            other => panic!("unexpected trigger: {other:?}"),
+        }
+        def.validate()
+            .expect("issue_assigned definitions must validate");
+        // Round-trip through canonical JSON storage.
+        let reparsed: WorkflowDef = serde_json::from_str(&json).expect("json round-trip");
+        assert!(matches!(reparsed.trigger, TriggerDef::IssueAssigned { .. }));
+    }
+
+    #[test]
+    fn issue_assigned_trigger_allows_optional_filter() {
+        let yaml = concat!(
+            "name: Any Assignment\n",
+            "trigger:\n",
+            "  on: issue_assigned\n",
+            "steps:\n",
+            "  - id: ping\n",
+            "    action: send_message\n",
+            "    text: someone got a task\n",
+        );
+        let (def, _) = parse_yaml(yaml).expect("parse failed");
+        match &def.trigger {
+            TriggerDef::IssueAssigned { filter } => assert!(filter.is_none()),
+            other => panic!("unexpected trigger: {other:?}"),
+        }
+        def.validate().expect("validate");
+    }
+
+    #[test]
+    fn issue_assigned_trigger_rejects_reply_in_thread() {
+        let yaml = concat!(
+            "name: Bad Thread\n",
+            "trigger:\n",
+            "  on: issue_assigned\n",
+            "steps:\n",
+            "  - id: s1\n",
+            "    action: send_message\n",
+            "    text: hi\n",
+            "    reply_in_thread: true\n",
+        );
+        // Validation runs inside parse_yaml, so the definition itself must
+        // be built via serde to exercise validate() directly.
+        let def: WorkflowDef = serde_yaml::from_str(yaml).expect("parse failed");
+        let err = def.validate().expect_err("must reject reply_in_thread");
+        assert!(
+            err.to_string().contains("reply_in_thread"),
+            "error should mention reply_in_thread: {err}"
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ export const TRIGGER_TYPES = [
   "diff_posted",
   "webhook",
   "schedule",
+  "issue_assigned",
 ] as const;
 export type TriggerType = (typeof TRIGGER_TYPES)[number];
 
@@ -25,6 +26,7 @@ export const SELECTABLE_TRIGGER_TYPES = [
   "message_posted",
   "reaction_added",
   "diff_posted",
+  "issue_assigned",
   "webhook",
   "schedule",
 ] as const satisfies readonly TriggerType[];
@@ -104,6 +106,7 @@ export const TRIGGER_LABELS: Record<TriggerType, string> = {
   diff_posted: "Diff Posted",
   webhook: "Webhook",
   schedule: "Schedule",
+  issue_assigned: "Issue Assigned",
 };
 
 export const ACTION_LABELS: Record<ActionType, string> = {
@@ -288,6 +291,7 @@ const TRIGGER_KEYS: Record<TriggerType, ReadonlySet<string>> = {
   diff_posted: new Set(["on", "filter"]),
   webhook: new Set(["on"]),
   schedule: new Set(["on", "cron", "interval"]),
+  issue_assigned: new Set(["on", "filter"]),
 };
 const COMMON_STEP_KEYS = ["id", "name", "action", "if", "timeout_secs"];
 const ACTION_STEP_KEYS: Record<ActionType, ReadonlySet<string>> = {

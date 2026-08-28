@@ -161,6 +161,10 @@ function getTriggerCardClause(
         : "When a diff is posted";
     case "webhook":
       return "When a webhook arrives";
+    case "issue_assigned":
+      return nonEmptyString(trigger.filter)
+        ? "When a matching issue is assigned"
+        : "When an issue is assigned to someone";
     case "schedule":
       return getScheduleCardClause(trigger);
     default:

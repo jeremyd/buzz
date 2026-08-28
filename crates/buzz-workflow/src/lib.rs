@@ -322,21 +322,55 @@ impl WorkflowEngine {
         community_id: CommunityId,
         event: &buzz_core::StoredEvent,
     ) -> Result<(), WorkflowError> {
-        let Some(channel_id) = event.channel_id else {
-            tracing::debug!(
-                event_id = %event.event.id.to_hex(),
-                kind = event_kind_u32(&event.event),
-                "Skipping workflow trigger — event has no channel_id"
-            );
-            return Ok(());
-        };
-
         let kind_u32 = event_kind_u32(&event.event);
 
         // Exclude workflow execution events to prevent infinite loops.
         if is_workflow_execution_kind(kind_u32) {
             return Ok(());
         }
+
+        // Issue assignment operations are kind:1 *global* events — ingest
+        // stores them with `channel_id = NULL` (see `is_global_only_kind`).
+        // For an `issue_assigned` trigger, resolve the trigger channel from
+        // the repository's `buzz-channel` binding (its kind:30617
+        // announcement) instead of the event's own scope.
+        let channel_id = if kind_u32 == buzz_core::kind::KIND_TEXT_NOTE {
+            match parse_issue_assignment(&event.event) {
+                Some(op) => match self.repo_trigger_channel(community_id, &op.repo).await {
+                    Some(ch) => ch,
+                    None => {
+                        // The repo is unknown, soft-deleted, or not bound to a
+                        // channel — there is no workflow audience for it.
+                        tracing::debug!(
+                            event_id = %event.event.id.to_hex(),
+                            kind = kind_u32,
+                            "Skipping workflow trigger — issue assignment repo is not channel-bound"
+                        );
+                        return Ok(());
+                    }
+                },
+                // Plain kind:1 note — no workflow trigger applies (kind:1 is
+                // global-only, so it never reaches the channel-scoped path).
+                None => {
+                    tracing::debug!(
+                        event_id = %event.event.id.to_hex(),
+                        kind = kind_u32,
+                        "Skipping workflow trigger — global event with no trigger semantics"
+                    );
+                    return Ok(());
+                }
+            }
+        } else {
+            let Some(channel_id) = event.channel_id else {
+                tracing::debug!(
+                    event_id = %event.event.id.to_hex(),
+                    kind = kind_u32,
+                    "Skipping workflow trigger — event has no channel_id"
+                );
+                return Ok(());
+            };
+            channel_id
+        };
 
         let cache_key = (community_id, channel_id);
         let workflows = match self.workflow_cache.get(&cache_key) {
@@ -357,7 +391,35 @@ impl WorkflowEngine {
             return Ok(());
         }
 
-        let trigger_ctx = build_trigger_context(event);
+        let mut trigger_ctx = build_trigger_context(event);
+
+        // `issue_assigned` triggers: kind:1 assignment operations reach this
+        // point only via the repo-binding path above (plain kind:1 notes were
+        // skipped there). Enrich the context once: verify the operation is
+        // *trusted* (NIP-34: signer is the issue author or the repo owner, or
+        // it is a self-assignment), then resolve the issue's author and title.
+        // Untrusted operations are dropped before any workflow lookup or run.
+        let assignment_op = if kind_u32 == buzz_core::kind::KIND_TEXT_NOTE {
+            parse_issue_assignment(&event.event)
+        } else {
+            None
+        };
+        if let Some(op) = &assignment_op {
+            match self
+                .enrich_issue_assignment(community_id, op, &mut trigger_ctx)
+                .await
+            {
+                IssueAssignmentTrust::Trusted => {}
+                IssueAssignmentTrust::Untrusted(reason) => {
+                    tracing::debug!(
+                        event_id = %event.event.id.to_hex(),
+                        reason,
+                        "Skipping issue_assigned workflow — untrusted assignment operation"
+                    );
+                    return Ok(());
+                }
+            }
+        }
 
         let trigger_ctx_json: serde_json::Value = match serde_json::to_value(&trigger_ctx) {
             Ok(v) => v,
@@ -904,7 +966,8 @@ async fn should_fire_workflow(
     let filter = match &def.trigger {
         TriggerDef::MessagePosted { filter }
         | TriggerDef::ReactionAdded { filter, .. }
-        | TriggerDef::DiffPosted { filter } => filter.as_ref(),
+        | TriggerDef::DiffPosted { filter }
+        | TriggerDef::IssueAssigned { filter } => filter.as_ref(),
         TriggerDef::Schedule { .. } | TriggerDef::Webhook => None,
     };
     if let Some(expr) = filter {
@@ -1036,13 +1099,248 @@ fn owner_authority_allows(role: Option<&str>, needs_elevated: bool) -> bool {
 
 /// Returns `true` if the trigger type matches the given event kind.
 fn trigger_matches_event(trigger: &TriggerDef, kind_u32: u32) -> bool {
-    use buzz_core::kind::{KIND_REACTION, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF};
+    use buzz_core::kind::{
+        KIND_REACTION, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF, KIND_TEXT_NOTE,
+    };
     match trigger {
         TriggerDef::MessagePosted { .. } => kind_u32 == KIND_STREAM_MESSAGE,
         TriggerDef::ReactionAdded { .. } => kind_u32 == KIND_REACTION,
         TriggerDef::DiffPosted { .. } => kind_u32 == KIND_STREAM_MESSAGE_DIFF,
+        // Assignment operations are kind:1 comments; `parse_issue_assignment`
+        // and the trust gate in `on_event` filter out plain notes and
+        // untrusted operations before any run is created.
+        TriggerDef::IssueAssigned { .. } => kind_u32 == KIND_TEXT_NOTE,
         // Schedule and Webhook triggers are not fired by channel events.
         TriggerDef::Schedule { .. } | TriggerDef::Webhook => false,
+    }
+}
+
+/// Repository coordinates parsed from an `a` tag (`<kind>:<owner-hex>:<d>`).
+/// Local mirror of `buzz_sdk::builders::GitRepoCoord` (buzz-workflow does not
+/// depend on buzz-sdk; the shape is pinned by NIP-34).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoCoord {
+    /// 64-char hex pubkey of the repo's announcing owner (lowercased).
+    owner: String,
+    /// The repo's `d`-tag identifier.
+    id: String,
+}
+
+/// A parsed NIP-34 issue assignment operation (kind:1 comment labeled
+/// `t: assignment` with an `e: <issue> root` tag and an `a: <repo>` tag).
+///
+/// Mirrors the event shape written by
+/// `buzz_sdk::builders::build_git_issue_assignment`: `["e", <issue>, "", "root"]`,
+/// `["a", <kind>:<owner>:<d>]`, one `["p", <assignee>]` per assignee, and
+/// `["t", "assignment"]`. Unassignment operations (`t: unassignment`) are not
+/// parsed — this trigger fires on assignments only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct IssueAssignmentOp {
+    /// Repo coordinates, from the `a` tag (`<kind>:<owner-pubkey-hex>:<repo-id>`).
+    repo: RepoCoord,
+    /// Assignee pubkeys (hex, lowercased), from the `p` tags.
+    assignees: Vec<String>,
+    /// Issue event ID (hex), from the root `e` tag.
+    issue_id: String,
+}
+
+/// Parse a kind:1 event into an [`IssueAssignmentOp`]. Returns `None` for
+/// anything that is not an assignment operation.
+fn parse_issue_assignment(event: &nostr::Event) -> Option<IssueAssignmentOp> {
+    let has_assignment_label = event.tags.iter().any(|tag| {
+        tag.as_slice().first().map(|s| s.as_str()) == Some("t")
+            && tag.as_slice().get(1).map(|s| s.as_str()) == Some("assignment")
+    });
+    if !has_assignment_label {
+        return None;
+    }
+
+    // Root `e` tag names the issue.
+    let issue_id = event.tags.iter().find_map(|tag| {
+        let slice = tag.as_slice();
+        if slice.first().map(|s| s.as_str()) == Some("e")
+            && slice.get(3).map(|s| s.as_str()) == Some("root")
+        {
+            slice.get(1).and_then(|v| {
+                (v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
+                    .then(|| v.to_ascii_lowercase())
+            })
+        } else {
+            None
+        }
+    })?;
+
+    // `a` tag names the repo (`<kind>:<owner>:<d>`); parse into coordinates.
+    let a_value = event.tags.iter().find_map(|tag| {
+        let slice = tag.as_slice();
+        if slice.first().map(|s| s.as_str()) == Some("a") {
+            slice.get(1).cloned()
+        } else {
+            None
+        }
+    })?;
+    let parts = a_value.split(':').collect::<Vec<_>>();
+    if parts.len() != 3 {
+        return None;
+    }
+    let repo = RepoCoord {
+        owner: parts[1].to_ascii_lowercase(),
+        id: parts[2].to_string(),
+    };
+    if repo.owner.len() != 64 || !repo.owner.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    // `p` tags name the assignees.
+    let assignees: Vec<String> = event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let slice = tag.as_slice();
+            if slice.first().map(|s| s.as_str()) == Some("p") {
+                slice.get(1).and_then(|v| {
+                    (v.len() == 64 && v.chars().all(|c| c.is_ascii_hexdigit()))
+                        .then(|| v.to_ascii_lowercase())
+                })
+            } else {
+                None
+            }
+        })
+        .collect();
+    if assignees.is_empty() {
+        return None;
+    }
+
+    Some(IssueAssignmentOp {
+        repo,
+        assignees,
+        issue_id,
+    })
+}
+
+/// Outcome of the NIP-34 assignment trust gate.
+#[derive(Debug, PartialEq, Eq)]
+enum IssueAssignmentTrust {
+    Trusted,
+    Untrusted(&'static str),
+}
+
+impl WorkflowEngine {
+    /// Resolve the trigger channel for an `issue_assigned` workflow: the
+    /// `buzz-channel` tag of the repo's current kind:30617 announcement.
+    ///
+    /// This is the same mapping the git read gate uses — a workflow defined
+    /// in channel C fires for assignments on repos bound to channel C.
+    /// Returns `None` when the repo is unknown, soft-deleted, or not bound
+    /// (fail closed: unbound repos have no workflow audience).
+    async fn repo_trigger_channel(
+        &self,
+        community_id: CommunityId,
+        repo: &RepoCoord,
+    ) -> Option<Uuid> {
+        let Ok(owner_bytes) = hex::decode(&repo.owner) else {
+            return None;
+        };
+        if owner_bytes.len() != 32 {
+            return None;
+        }
+        let query = buzz_db::EventQuery {
+            kinds: Some(vec![30617]),
+            pubkey: Some(owner_bytes),
+            d_tag: Some(repo.id.clone()),
+            global_only: true,
+            limit: Some(1),
+            ..buzz_db::EventQuery::for_community(community_id)
+        };
+        let events = self.db.query_events(&query).await.ok()?;
+        let announcement = events.into_iter().next()?;
+        announcement.event.tags.iter().find_map(|tag| {
+            let slice = tag.as_slice();
+            if slice.first().map(|s| s.as_str()) == Some("buzz-channel") {
+                slice.get(1).and_then(|v| v.parse::<Uuid>().ok())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Apply the NIP-34 assignment trust rules and enrich the trigger context
+    /// with issue/repo variables.
+    ///
+    /// Trust: the operation signer must be the issue author or the repo
+    /// owner, or the operation must be a self-assignment (sole assignee is
+    /// the signer). Untrusted operations never fire workflows.
+    ///
+    /// Enrichment populates (via `webhook_fields`, which both templates and
+    /// evalexpr filters read as `trigger_<name>`):
+    /// - `trigger_assignee` — first assignee pubkey hex (hex, not npub: a
+    ///   filter comparing against a literal pubkey is hex)
+    /// - `trigger_assignees` — comma-joined hex pubkeys (multi-assign ops)
+    /// - `trigger_issue_id` — the issue's event id (hex)
+    /// - `trigger_issue_title` — the issue's `subject` tag (empty if the
+    ///   issue event cannot be resolved)
+    /// - `trigger_repo_id` — repo d-tag
+    /// - `trigger_repo_owner` — repo owner pubkey hex
+    async fn enrich_issue_assignment(
+        &self,
+        community_id: CommunityId,
+        op: &IssueAssignmentOp,
+        ctx: &mut executor::TriggerContext,
+    ) -> IssueAssignmentTrust {
+        // Resolve the issue to learn its author (needed for trust) and title.
+        let issue = match hex::decode(&op.issue_id) {
+            Ok(id) if id.len() == 32 => self
+                .db
+                .get_event_by_id(community_id, &id)
+                .await
+                .ok()
+                .flatten(),
+            _ => None,
+        };
+
+        let signer = ctx.author.to_ascii_lowercase();
+        let signer_is_repo_owner = signer == op.repo.owner;
+        let signer_is_issue_author = issue
+            .as_ref()
+            .is_some_and(|ev| ev.event.pubkey.to_hex().to_ascii_lowercase() == signer);
+        let is_self_assignment = op.assignees.len() == 1 && op.assignees[0] == signer;
+
+        if !signer_is_repo_owner && !signer_is_issue_author && !is_self_assignment {
+            return IssueAssignmentTrust::Untrusted(
+                "signer is neither issue author, repo owner, nor the sole self-assignee",
+            );
+        }
+
+        let issue_title = issue
+            .as_ref()
+            .and_then(|ev| {
+                ev.event.tags.iter().find_map(|tag| {
+                    let slice = tag.as_slice();
+                    if slice.first().map(|s| s.as_str()) == Some("subject") {
+                        slice.get(1).cloned()
+                    } else {
+                        None
+                    }
+                })
+            })
+            .unwrap_or_default();
+
+        ctx.webhook_fields.insert(
+            "assignee".to_string(),
+            op.assignees.first().cloned().unwrap_or_default(),
+        );
+        ctx.webhook_fields
+            .insert("assignees".to_string(), op.assignees.join(","));
+        ctx.webhook_fields
+            .insert("issue_id".to_string(), op.issue_id.clone());
+        ctx.webhook_fields
+            .insert("issue_title".to_string(), issue_title);
+        ctx.webhook_fields
+            .insert("repo_id".to_string(), op.repo.id.clone());
+        ctx.webhook_fields
+            .insert("repo_owner".to_string(), op.repo.owner.clone());
+
+        IssueAssignmentTrust::Trusted
     }
 }
 
@@ -1371,6 +1669,254 @@ steps:
             &trigger,
             buzz_core::kind::KIND_STREAM_MESSAGE
         ));
+    }
+
+    #[test]
+    fn trigger_matches_issue_assigned_on_kind1() {
+        let trigger = TriggerDef::IssueAssigned { filter: None };
+        assert!(trigger_matches_event(
+            &trigger,
+            buzz_core::kind::KIND_TEXT_NOTE
+        ));
+        assert!(!trigger_matches_event(
+            &trigger,
+            buzz_core::kind::KIND_STREAM_MESSAGE
+        ));
+        assert!(!trigger_matches_event(
+            &trigger,
+            buzz_core::kind::KIND_REACTION
+        ));
+    }
+
+    /// Parse a `&[&str]` into a nostr tag (helper for building test events).
+    fn test_tag(parts: &[&str]) -> nostr::Tag {
+        nostr::Tag::parse(parts.to_vec()).expect("valid tag")
+    }
+
+    /// Build a kind:1 assignment operation shaped exactly like
+    /// `buzz_sdk::builders::build_git_issue_assignment` output:
+    /// `["e", <issue>, "", "root"]`, `["a", <repo>]`, `["p", <assignee>]`s,
+    /// `["t", "assignment"]`.
+    fn assignment_event(
+        signer: &nostr::Keys,
+        issue_id: &str,
+        assignees: &[String],
+    ) -> nostr::Event {
+        let owner = signer.public_key().to_hex();
+        let mut tags = vec![
+            test_tag(&["e", issue_id, "", "root"]),
+            test_tag(&["a", &format!("30617:{owner}:buzz-zzub")]),
+        ];
+        for a in assignees {
+            tags.push(test_tag(&["p", a]));
+        }
+        tags.push(test_tag(&["t", "assignment"]));
+        nostr::EventBuilder::new(nostr::Kind::Custom(1), "Assigned this issue to someone")
+            .tags(tags)
+            .sign_with_keys(signer)
+            .expect("sign")
+    }
+
+    #[test]
+    fn parse_issue_assignment_accepts_valid_operation() {
+        let signer = nostr::Keys::generate();
+        let assignee = "0".repeat(64);
+        let event = assignment_event(&signer, &"a".repeat(64), std::slice::from_ref(&assignee));
+        let op = parse_issue_assignment(&event).expect("must parse");
+        assert_eq!(op.repo.owner, signer.public_key().to_hex().to_lowercase());
+        assert_eq!(op.repo.id, "buzz-zzub");
+        assert_eq!(op.assignees, vec![assignee]);
+    }
+
+    #[test]
+    fn parse_issue_assignment_rejects_non_assignments() {
+        let signer = nostr::Keys::generate();
+        let issue_id = "a".repeat(64);
+        let owner = signer.public_key().to_hex();
+
+        // Plain note — no tags.
+        let plain = nostr::EventBuilder::new(nostr::Kind::Custom(1), "hello")
+            .sign_with_keys(&signer)
+            .expect("sign");
+        assert!(parse_issue_assignment(&plain).is_none());
+
+        // Unassignment operations are out of scope for this trigger.
+        let unassign = nostr::EventBuilder::new(nostr::Kind::Custom(1), "Unassigned")
+            .tags(vec![
+                test_tag(&["e", &issue_id, "", "root"]),
+                test_tag(&["a", &format!("30617:{owner}:buzz-zzub")]),
+                test_tag(&["p", &"0".repeat(64)]),
+                test_tag(&["t", "unassignment"]),
+            ])
+            .sign_with_keys(&signer)
+            .expect("sign");
+        assert!(parse_issue_assignment(&unassign).is_none());
+
+        // Missing root marker on the e tag.
+        let no_root = nostr::EventBuilder::new(nostr::Kind::Custom(1), "x")
+            .tags(vec![
+                test_tag(&["e", &issue_id]),
+                test_tag(&["t", "assignment"]),
+            ])
+            .sign_with_keys(&signer)
+            .expect("sign");
+        assert!(parse_issue_assignment(&no_root).is_none());
+
+        // No assignee p tags.
+        let no_assignee = nostr::EventBuilder::new(nostr::Kind::Custom(1), "x")
+            .tags(vec![
+                test_tag(&["e", &issue_id, "", "root"]),
+                test_tag(&["a", &format!("30617:{owner}:buzz-zzub")]),
+                test_tag(&["t", "assignment"]),
+            ])
+            .sign_with_keys(&signer)
+            .expect("sign");
+        assert!(parse_issue_assignment(&no_assignee).is_none());
+    }
+
+    /// `trigger_assignee` and friends resolve in templates and filters the
+    /// same way webhook fields do — via `webhook_fields` on the context.
+    #[tokio::test]
+    async fn issue_assigned_trigger_variables_resolve() {
+        let mut ctx = executor::TriggerContext {
+            webhook_fields: HashMap::from([
+                ("assignee".to_string(), "aa".repeat(32)),
+                ("issue_id".to_string(), "b".repeat(32)),
+                (
+                    "issue_title".to_string(),
+                    "Add an issue_assigned trigger".to_string(),
+                ),
+                ("repo_id".to_string(), "buzz-zzub".to_string()),
+                ("repo_owner".to_string(), "cc".repeat(32)),
+            ]),
+            ..Default::default()
+        };
+        ctx.author = "cc".repeat(32);
+
+        // Template resolution: {{trigger.issue_title}} etc.
+        let out = executor::resolve_template(
+            "Assigned {{trigger.issue_title}} ({{trigger.repo_id}}) to {{trigger.assignee}}",
+            &ctx,
+            &HashMap::new(),
+        )
+        .expect("template");
+        assert_eq!(
+            out,
+            format!(
+                "Assigned Add an issue_assigned trigger (buzz-zzub) to {}",
+                "aa".repeat(32)
+            )
+        );
+
+        // evalexpr filter over trigger_repo_id / trigger_repo_owner.
+        let ok = executor::evaluate_condition(
+            "str_contains(trigger_repo_id, \"zzub\") && trigger_repo_owner != \"\"",
+            &ctx,
+            &HashMap::new(),
+        )
+        .await
+        .expect("condition");
+        assert!(ok);
+    }
+
+    /// Untrusted assignment operations (signer is neither issue author, repo
+    /// owner, nor the sole self-assignee) must not fire the workflow;
+    /// owner-signed assignments and self-assignments must. Requires Postgres.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn on_event_issue_assigned_trust_gate() {
+        let db = setup_db().await;
+        let repo_owner = nostr::Keys::generate();
+        let creator = repo_owner.public_key().to_bytes().to_vec();
+        let stranger = nostr::Keys::generate();
+        let stranger_bytes = stranger.public_key().to_bytes().to_vec();
+        let (community, channel_id) = setup_channel(&db, &creator, &stranger_bytes).await;
+
+        // Issue authored by the repo owner; assignee is the stranger (an agent).
+        let assignee_hex = stranger.public_key().to_hex().to_lowercase();
+        let owner_hex = repo_owner.public_key().to_hex();
+        let issue = nostr::EventBuilder::new(nostr::Kind::Custom(1621), "issue body")
+            .tags(vec![
+                test_tag(&["subject", "Add an issue_assigned trigger"]),
+                test_tag(&["a", &format!("30617:{owner_hex}:buzz-zzub")]),
+            ])
+            .sign_with_keys(&repo_owner)
+            .expect("sign issue");
+        let issue_id = issue.id.to_hex();
+        db.insert_event(community, &issue, None)
+            .await
+            .expect("insert issue");
+
+        // Repo announcement binding the repo to the trigger channel.
+        let announcement = nostr::EventBuilder::new(nostr::Kind::Custom(30617), "")
+            .tags(vec![
+                test_tag(&["d", "buzz-zzub"]),
+                test_tag(&["buzz-channel", &channel_id.to_string()]),
+            ])
+            .sign_with_keys(&repo_owner)
+            .expect("sign announcement");
+        db.insert_event(community, &announcement, None)
+            .await
+            .expect("insert announcement");
+
+        let def_json = serde_json::json!({
+            "name": "auto-start",
+            "trigger": {"on": "issue_assigned"},
+            "steps": [{"id": "s1", "action": "send_message", "text": "task assigned"}],
+            "enabled": true,
+        })
+        .to_string();
+        let workflow_id = db
+            .create_workflow(
+                community,
+                Some(channel_id),
+                &creator,
+                "auto-start",
+                &def_json,
+                &[0u8; 32],
+            )
+            .await
+            .expect("create workflow");
+
+        let engine = Arc::new(WorkflowEngine::new(db.clone(), WorkflowConfig::default()));
+
+        // Untrusted: a third party assigns someone else.
+        let third = nostr::Keys::generate();
+        let assignee_ref = assignee_hex.clone();
+        let untrusted = assignment_event(&third, &issue_id, std::slice::from_ref(&assignee_ref));
+        engine
+            .on_event(community, &buzz_core::StoredEvent::new(untrusted, None))
+            .await
+            .expect("on_event untrusted");
+        let runs = db
+            .list_workflow_runs(community, workflow_id, 10)
+            .await
+            .expect("runs");
+        assert!(runs.is_empty(), "untrusted assignment must not fire");
+
+        // Trusted: repo owner assigns the agent.
+        let trusted = assignment_event(&repo_owner, &issue_id, std::slice::from_ref(&assignee_hex));
+        engine
+            .on_event(community, &buzz_core::StoredEvent::new(trusted, None))
+            .await
+            .expect("on_event trusted");
+        let runs = db
+            .list_workflow_runs(community, workflow_id, 10)
+            .await
+            .expect("runs");
+        assert_eq!(runs.len(), 1, "owner-signed assignment must fire");
+
+        // Trusted: self-assignment by the agent itself.
+        let self_op = assignment_event(&stranger, &issue_id, &[stranger.public_key().to_hex()]);
+        engine
+            .on_event(community, &buzz_core::StoredEvent::new(self_op, None))
+            .await
+            .expect("on_event self");
+        let runs = db
+            .list_workflow_runs(community, workflow_id, 10)
+            .await
+            .expect("runs");
+        assert_eq!(runs.len(), 2, "self-assignment must fire");
     }
 
     #[tokio::test]

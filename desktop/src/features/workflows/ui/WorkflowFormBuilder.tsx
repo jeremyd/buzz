@@ -115,6 +115,8 @@ function TriggerConfigFields({
           trigger={trigger}
         />
       );
+    case "issue_assigned":
+      return null;
     default:
       return null;
   }
@@ -643,6 +645,7 @@ export const WorkflowFormBuilder = React.forwardRef<
     reaction_added: SmilePlus,
     schedule: CalendarClock,
     webhook: Webhook,
+    issue_assigned: GitPullRequest,
   }[formState.trigger.on];
 
   return (

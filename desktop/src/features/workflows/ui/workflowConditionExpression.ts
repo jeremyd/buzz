@@ -43,6 +43,14 @@ const FIELDS_BY_TRIGGER: Record<TriggerType, ConditionField[]> = {
   ],
   webhook: [],
   schedule: [],
+  issue_assigned: [
+    { label: "Assignee", value: "trigger_assignee" },
+    { label: "Issue title", value: "trigger_issue_title" },
+    { label: "Issue ID", value: "trigger_issue_id" },
+    { label: "Repo ID", value: "trigger_repo_id" },
+    { label: "Repo owner", value: "trigger_repo_owner" },
+    AUTHOR_FIELD,
+  ],
 };
 
 export function conditionFieldsForTrigger(

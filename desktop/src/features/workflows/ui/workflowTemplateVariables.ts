@@ -91,6 +91,49 @@ function triggerVariables(
           group: "Trigger",
         },
       ];
+    case "issue_assigned":
+      return [
+        {
+          value: "trigger.assignee",
+          description: "Assignee pubkey (hex)",
+          group: "Trigger",
+        },
+        {
+          value: "trigger.assignees",
+          description: "All assignee pubkeys, comma-joined",
+          group: "Trigger",
+        },
+        {
+          value: "trigger.issue_id",
+          description: "Issue event ID",
+          group: "Trigger",
+        },
+        {
+          value: "trigger.issue_title",
+          description: "Issue title",
+          group: "Trigger",
+        },
+        {
+          value: "trigger.repo_id",
+          description: "Repository ID",
+          group: "Trigger",
+        },
+        {
+          value: "trigger.repo_owner",
+          description: "Repository owner pubkey (hex)",
+          group: "Trigger",
+        },
+        {
+          value: "trigger.author",
+          description: "Who performed the assignment",
+          group: "Trigger",
+        },
+        {
+          value: "trigger.timestamp",
+          description: "Assignment time (unix)",
+          group: "Trigger",
+        },
+      ];
   }
 }
 
