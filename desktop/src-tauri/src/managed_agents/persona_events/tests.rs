@@ -863,6 +863,47 @@ mod flush_barrier {
         format!("http://{addr}")
     }
 
+    /// Stub relay that accepts every `POST /events` and records each posted
+    /// event JSON. Returns the HTTP base URL and the capture buffer.
+    async fn spawn_capturing_stub_relay() -> (
+        String,
+        std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) {
+        use axum::{http::StatusCode, routing::post, Router};
+
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let app = Router::new().route(
+            "/events",
+            post(move |body: String| {
+                let sink = std::sync::Arc::clone(&sink);
+                async move {
+                    let event: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+                    let id = event
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    sink.lock().unwrap().push(event);
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({"event_id": id, "accepted": true, "message": ""})
+                            .to_string(),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub relay");
+        let addr = listener.local_addr().expect("stub relay addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.ok();
+        });
+        (format!("http://{addr}"), captured)
+    }
+
     fn retain_signed(
         conn: &rusqlite::Connection,
         keys: &nostr::Keys,
@@ -988,5 +1029,79 @@ mod flush_barrier {
             !row(KIND_PERSONA, "unrelated").pending_sync,
             "unrelated row marked synced"
         );
+    }
+
+    /// A replaceable head whose retained `created_at` has aged past the relay's
+    /// ±900s ingest window must be re-signed at publish time (fresh timestamp,
+    /// same kind/content/tags) instead of re-POSTing the byte-frozen original
+    /// on every 30s sweep forever. A future-dated head has no acceptable
+    /// timestamp yet and stays pending.
+    #[tokio::test]
+    async fn stale_head_resigns_at_publish_and_future_head_stays_pending() {
+        let keys = nostr::Keys::generate();
+        let pubkey = keys.public_key().to_hex();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("retention.db");
+        let now = nostr::Timestamp::now().as_secs() as i64;
+
+        let retain_signed_at = |conn: &rusqlite::Connection, d_tag: &str, created_at: i64| {
+            let event = EventBuilder::new(Kind::Custom(KIND_PERSONA as u16), "{}")
+                .tags(vec![Tag::parse(["d", d_tag]).unwrap()])
+                .custom_created_at(nostr::Timestamp::from(created_at as u64))
+                .sign_with_keys(&keys)
+                .expect("sign test event");
+            retain_event(
+                conn,
+                &RetainedEvent {
+                    kind: KIND_PERSONA,
+                    pubkey: pubkey.clone(),
+                    d_tag: d_tag.to_string(),
+                    content: event.content.to_string(),
+                    created_at,
+                    raw_event: event.as_json(),
+                    pending_sync: true,
+                },
+            )
+            .expect("retain test event");
+        };
+        {
+            let conn = open_retention_db(&db_path).expect("open db");
+            retain_signed_at(&conn, "stale", 1000); // decades outside the window
+            retain_signed_at(&conn, "future", now + 5000); // beyond now+900
+        }
+
+        let state = build_app_state();
+        *state.keys.lock().unwrap() = keys;
+        let (relay_url, captured) = spawn_capturing_stub_relay().await;
+        *state.relay_url_override.lock().unwrap() = Some(relay_url);
+
+        let flushed = flush_pending_events(&db_path, &state).await.expect("flush");
+        assert_eq!(flushed, 1, "only the stale head publishes (re-signed)");
+
+        let posted = captured.lock().unwrap();
+        assert_eq!(posted.len(), 1, "future-dated head must not be POSTed");
+        let event = &posted[0];
+        assert_eq!(
+            event.get("kind").and_then(serde_json::Value::as_u64),
+            Some(KIND_PERSONA as u64)
+        );
+        let posted_ts = event
+            .get("created_at")
+            .and_then(serde_json::Value::as_i64)
+            .expect("created_at");
+        assert!(
+            (posted_ts - now).abs() <= 120,
+            "re-signed head must carry a fresh in-window timestamp, got {posted_ts} vs now {now}"
+        );
+
+        let conn = open_retention_db(&db_path).expect("reopen db");
+        let row = |d_tag: &str| {
+            get_retained_event(&conn, KIND_PERSONA, &pubkey, d_tag)
+                .unwrap()
+                .unwrap()
+        };
+        assert!(!row("stale").pending_sync, "stale head marked synced");
+        assert!(row("future").pending_sync, "future head stays pending");
+        assert_eq!(row("stale").created_at, 1000, "retained row untouched");
     }
 }

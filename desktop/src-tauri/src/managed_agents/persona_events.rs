@@ -409,7 +409,23 @@ pub(crate) async fn flush_pending_events_at(
             // original `created_at`/`content`, which are untouched.
             resign_with_fresh_timestamp(&event, state)?
         } else {
-            event
+            // Replaceable heads publish byte-frozen to keep event ids stable,
+            // but a head retained while the relay was unreachable ages past
+            // the same ±900s ingest window and is then rejected identically on
+            // every sweep — an infinite 30s retry loop. Re-sign a stale head
+            // at publish time (a fresh `created_at` still dominates the
+            // coordinate; `mark_synced` keys on the untouched row). A
+            // future-dated head — a monotonic bump past a skewed prior head —
+            // has no acceptable timestamp yet: leave it pending to converge as
+            // the wall clock advances, mirroring the tombstone rule above.
+            let now = nostr::Timestamp::now().as_secs() as i64;
+            if current.created_at - now > RELAY_ACCEPT_WINDOW_SECS {
+                continue;
+            } else if now - current.created_at > RELAY_ACCEPT_WINDOW_SECS {
+                resign_with_fresh_timestamp(&event, state)?
+            } else {
+                event
+            }
         };
 
         // Bound the relay await: the admission gate can wait up to 300s and the
