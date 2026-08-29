@@ -3305,6 +3305,25 @@ pub(crate) async fn fetch_project_home_for_channel(
         let mut page_events = fetch_with_retry(|| async {
             match timeout(CONTEXT_FETCH_TIMEOUT, rest.query_raw_all(filter.clone())).await {
                 Ok(Ok(events)) => Some(events),
+                // A definitive 400/422 means this relay cannot parse the query
+                // (e.g. no `#buzz-channel` filter support) and will answer the
+                // same on every retry. Requeueing the turn forever would starve
+                // the agent of every mention, so degrade to "no project home" —
+                // the same context agents ran with before project lookup
+                // existed. Authorization refusals (401/403) stay indeterminate:
+                // there the project may exist but be unreadable, and building a
+                // session without it could drop authoritative instructions.
+                Ok(Err(crate::relay::RelayError::Rejected { status, message }))
+                    if status == 400 || status == 422 =>
+                {
+                    tracing::warn!(
+                        channel_id = %channel_id,
+                        status,
+                        "project home query rejected by relay ({message}); \
+                         proceeding without a project home"
+                    );
+                    Some(Vec::new())
+                }
                 Ok(Err(e)) => {
                     tracing::debug!(
                         channel_id = %channel_id,

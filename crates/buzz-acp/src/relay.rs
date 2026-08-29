@@ -433,11 +433,18 @@ impl RestClient {
                     )));
                 }
                 Ok(resp) => {
-                    return Err(RelayError::Http(format!(
-                        "{method} {} returned HTTP {}",
-                        path,
-                        resp.status()
-                    )));
+                    let status = resp.status().as_u16();
+                    let body: String = resp
+                        .text()
+                        .await
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect();
+                    return Err(RelayError::Rejected {
+                        status,
+                        message: format!("{method} {path} returned HTTP {status}: {body}"),
+                    });
                 }
                 Err(e) if e.is_timeout() || e.is_connect() => {
                     tracing::warn!("{method} {path} network error: {e}");
@@ -617,6 +624,13 @@ pub enum RelayError {
 
     #[error("HTTP error: {0}")]
     Http(String),
+
+    /// A definitive HTTP refusal — a non-retriable 4xx the relay will answer
+    /// identically on every attempt (e.g. 400 for a filter shape it does not
+    /// support). Carries the status so callers can distinguish "this relay
+    /// cannot serve this query" from transient failures worth retrying.
+    #[error("HTTP {status}: {message}")]
+    Rejected { status: u16, message: String },
 
     #[error("Unexpected message: {0}")]
     UnexpectedMessage(String),
@@ -3883,7 +3897,10 @@ pub(crate) fn parse_relay_message(text: &str) -> Result<RelayMessage, RelayError
 /// - `NoAuthChallenge`, `ConnectionClosed`, `Timeout` — timing/link noise.
 fn is_terminal_connect_error(err: &RelayError) -> bool {
     match err {
-        RelayError::Http(_) | RelayError::Json(_) | RelayError::UnexpectedMessage(_) => true,
+        RelayError::Http(_)
+        | RelayError::Rejected { .. }
+        | RelayError::Json(_)
+        | RelayError::UnexpectedMessage(_) => true,
         RelayError::WebSocket(e) => is_terminal_ws_error(e.as_ref()),
         RelayError::AuthFailed(message) => is_terminal_auth_failure(message),
         RelayError::NoAuthChallenge | RelayError::ConnectionClosed | RelayError::Timeout => false,
