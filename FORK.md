@@ -118,6 +118,47 @@ use the recovery recipes above. Do not "fix" the situation by merging,
 cherry-picking the whole fork history, or resetting the branch to
 `origin/main` (which discards the contributor's work).
 
+## Accepting contributions from downstream forks
+
+Downstream forks (e.g. buzz-zzub) maintain their own carry stacks on top of
+this fork, exactly as this fork does on top of `block/main`. When a downstream
+carry is useful to everyone running this fork, we adopt it into our carry
+stack. The first such acceptance (2026-09-02, from buzz-zzub) set the
+procedure:
+
+1. **Add the contributor's repo as a read-only remote** (e.g. `zzub`) and
+   fetch. Their branch must be based on our published `main` (or recoverable
+   via a `backup/pre-float-*` snapshot per the recipes above).
+2. **Cherry-pick verbatim** onto an accept branch off `main`:
+   `git cherry-pick -x -s <sha>...`. `-x` records provenance (resolvable via
+   the remote), `-s` adds our DCO sign-off *alongside* the contributor's —
+   authorship and their existing `Signed-off-by:` trailers are preserved.
+   Do not edit the patches: patch-id equality is what lets the contributor's
+   next re-float (see "After each float" above) drop the accepted commits
+   from their stack automatically. If a patch needs fixes (formatting,
+   lint), bounce it back for a corrected resubmission instead of amending.
+3. **Tree-parity check**: `git diff <accept-branch> <their-branch> -- <paths
+   touched by the accepted commits>` must be empty — proof the cherry-picks
+   reproduce exactly the tree they reviewed and tested.
+4. **Validate in-cluster** (`just wb-check` — the contributor's own
+   validation may have run outside the pinned hermit toolchain, so gates
+   like `dart format`/`flutter analyze` must be re-run under ours), then
+   fast-forward `main` and push. No force dance needed.
+
+Once merged, accepted commits are ordinary carries: the float rebases them
+with everything else, and rebase preserves the author field, so the
+contributor's identity rides every future float automatically. There is no
+separate contributor registry — `git log block/main..main` and the preserved
+author/sign-off trailers are the record.
+
+**Guidance for downstream contributors:** keep generic fixes in commits
+separate from fork-identity changes (product renames, app identifiers, icons,
+version bumps) — bundled commits get skipped, not split by us. Validate with
+the repo's hermit toolchain (`. ./bin/activate-hermit`) and a warmed pub
+cache (`flutter pub get` in `mobile/`), otherwise `dart format` and the
+flutter_lints ruleset can pass vacuously in your environment and fail in
+ours.
+
 ## Package versioning
 
 GitLab CI (`.gitlab-ci.yml`) publishes Linux/Windows desktop bundles, an
