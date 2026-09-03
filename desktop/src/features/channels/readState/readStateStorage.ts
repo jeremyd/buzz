@@ -110,30 +110,44 @@ function isPrunableContextKey(contextId: string): boolean {
 }
 
 /**
- * Drops msg:/thread: markers older than the relay's 7-day horizon, then caps
- * the survivors at LOCAL_MAX_PRUNABLE_CONTEXTS (oldest first). Channel keys
- * are never pruned — they are small, bounded by membership, and losing one
- * would resurrect the channel's unread badge. Mirrors the eviction order the
- * publish path already applies in trimContextsToBudget.
+ * Drops msg:/thread: markers whose read-action recency is older than the
+ * relay's 7-day horizon, then caps the survivors at
+ * LOCAL_MAX_PRUNABLE_CONTEXTS (least recently affirmed first). Recency is
+ * `sourceCreatedAt` (when the marker last genuinely advanced), falling back
+ * to the marker value for legacy entries — an old-VALUED marker that the
+ * user re-affirmed yesterday can be the sole cover for an event newer than
+ * its channel/thread frontiers, and pruning it resurrects that event as
+ * unread. Channel keys are never pruned — they are small, bounded by
+ * membership, and losing one would resurrect the channel's unread badge.
+ * Mirrors the eviction order the publish path applies in
+ * trimContextsToBudget.
  */
 export function pruneStaleContexts(
   contexts: ReadonlyMap<string, number>,
   nowUnixSeconds: number,
+  sourceCreatedAt?: ReadonlyMap<string, number>,
 ): Map<string, number> {
   const cutoff = nowUnixSeconds - READ_STATE_HORIZON_SECONDS;
   const kept = new Map<string, number>();
   const prunable: [string, number][] = [];
+  const recency = (contextId: string, timestamp: number) =>
+    sourceCreatedAt?.get(contextId) ?? timestamp;
 
   for (const [contextId, timestamp] of contexts) {
     if (!isPrunableContextKey(contextId)) {
       kept.set(contextId, timestamp);
-    } else if (timestamp >= cutoff) {
+    } else if (recency(contextId, timestamp) >= cutoff) {
       prunable.push([contextId, timestamp]);
     }
   }
 
   if (prunable.length > LOCAL_MAX_PRUNABLE_CONTEXTS) {
-    prunable.sort((a, b) => b[1] - a[1]);
+    prunable.sort(
+      (a, b) =>
+        recency(b[0], b[1]) - recency(a[0], a[1]) ||
+        b[1] - a[1] ||
+        (a[0] < b[0] ? -1 : 1),
+    );
     prunable.length = LOCAL_MAX_PRUNABLE_CONTEXTS;
   }
   for (const [contextId, timestamp] of prunable) {
@@ -148,7 +162,11 @@ export function writeStoredReadState(
   publishableContextIds: ReadonlySet<string>,
   contextSourceCreatedAt: ReadonlyMap<string, number>,
 ): void {
-  const pruned = pruneStaleContexts(contexts, Math.floor(Date.now() / 1_000));
+  const pruned = pruneStaleContexts(
+    contexts,
+    Math.floor(Date.now() / 1_000),
+    contextSourceCreatedAt,
+  );
 
   const state: Record<string, string> = {};
   for (const [contextId, timestamp] of pruned) {

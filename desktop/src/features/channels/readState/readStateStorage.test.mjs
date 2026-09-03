@@ -76,6 +76,72 @@ test("pruneStaleContexts caps within-horizon prunable entries, newest kept", () 
   assert.equal(pruned.has(`msg:${String(total - 1).padStart(64, "0")}`), false);
 });
 
+test("pruneStaleContexts keeps a re-affirmed marker past the marker-value horizon", () => {
+  // Regression: a msg: marker whose VALUE is past the 7-day horizon but whose
+  // read action is recent (sole cover for an old thread reply the user keeps
+  // re-reading) must survive; an identical marker with no source entry falls
+  // back to marker-value aging and drops.
+  const cutoff = NOW - READ_STATE_HORIZON_SECONDS;
+  const reaffirmed = `msg:${"a".repeat(64)}`;
+  const legacy = `msg:${"b".repeat(64)}`;
+  const contexts = new Map([
+    [reaffirmed, cutoff - 100],
+    [legacy, cutoff - 100],
+  ]);
+
+  const pruned = pruneStaleContexts(
+    contexts,
+    NOW,
+    new Map([[reaffirmed, NOW - 60]]),
+  );
+
+  assert.equal(pruned.has(reaffirmed), true, "recent source keeps the marker");
+  assert.equal(pruned.has(legacy), false, "no source falls back to marker age");
+});
+
+test("pruneStaleContexts cap prefers recent read actions over marker values", () => {
+  const contexts = new Map();
+  const total = LOCAL_MAX_PRUNABLE_CONTEXTS + 1;
+  // Entry 0 has the OLDEST marker value but the newest read action.
+  const sources = new Map([[`msg:${String(0).padStart(64, "0")}`, NOW]]);
+  for (let i = 0; i < total; i++) {
+    contexts.set(`msg:${String(i).padStart(64, "0")}`, NOW - 10_000 + i);
+  }
+  contexts.set(`msg:${String(0).padStart(64, "0")}`, NOW - 100_000);
+
+  const pruned = pruneStaleContexts(contexts, NOW, sources);
+
+  assert.equal(pruned.size, LOCAL_MAX_PRUNABLE_CONTEXTS);
+  assert.equal(
+    pruned.has(`msg:${String(0).padStart(64, "0")}`),
+    true,
+    "oldest-valued entry survives the cap on read-action recency",
+  );
+});
+
+test("writeStoredReadState persists a source-retained marker across all three keys", () => {
+  // Seam bind for the prune path: an old-VALUED marker with a recent source
+  // must survive writeStoredReadState and round-trip through
+  // readStoredReadState — durable survival, not one-shot.
+  installLocalStorage();
+  const pubkey = "c".repeat(64);
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const oldValued = `msg:${"a".repeat(64)}`;
+  const staleValue = nowSeconds - READ_STATE_HORIZON_SECONDS - 500;
+
+  writeStoredReadState(
+    pubkey,
+    new Map([[oldValued, staleValue]]),
+    new Set([oldValued]),
+    new Map([[oldValued, nowSeconds]]),
+  );
+
+  const stored = readStoredReadState(pubkey);
+  assert.equal(stored.contexts.get(oldValued), staleValue);
+  assert.equal(stored.publishableContextIds.has(oldValued), true);
+  assert.equal(stored.contextSourceCreatedAt.get(oldValued), nowSeconds);
+});
+
 test("writeStoredReadState prunes all three keys consistently", () => {
   installLocalStorage();
   const pubkey = "f".repeat(64);
