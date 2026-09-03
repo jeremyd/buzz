@@ -400,7 +400,7 @@ test("resolveEffectiveTimestamp returns null when neither context nor parent has
   assert.equal(result, null);
 });
 
-test("applyRemoteContextTimestamp ignores older remote read markers from newer sync events", () => {
+test("applyRemoteContextTimestamp ignores older remote read markers and does not refresh source recency", () => {
   const effectiveState = new Map([["channel-1", 200]]);
   const contextSourceCreatedAt = new Map([["channel-1", 10]]);
 
@@ -414,7 +414,9 @@ test("applyRemoteContextTimestamp ignores older remote read markers from newer s
 
   assert.equal(result, "unchanged");
   assert.equal(effectiveState.get("channel-1"), 200);
-  assert.equal(contextSourceCreatedAt.get("channel-1"), 11);
+  // An unchanged merge (own-blob echo/refetch) must not bump source recency;
+  // recency-keyed eviction depends on it reflecting genuine advances only.
+  assert.equal(contextSourceCreatedAt.get("channel-1"), 10);
 });
 
 test("applyRemoteContextTimestamp advances to newer remote read markers", () => {
@@ -605,6 +607,89 @@ test("trimContextsToBudget_channelOnlyBlobExceedsBudget_fitsAfterTrimFalse", () 
   assert.ok("channel:some-channel-id" in contexts);
 });
 
+test("trimContextsToBudget_recentSourceOldMarker_survivesEviction", () => {
+  // Regression: a marker whose VALUE is old but whose read action is recent
+  // (e.g. the sole cover for a thread reply the user keeps re-reading) must
+  // not be evicted ahead of stale-source entries with newer marker values.
+  const target = `msg:${MSG_ID}`;
+  const filler = `msg:${"c".repeat(64)}`;
+  const contexts = { [target]: 1, [filler]: 500 };
+  const sourceCreatedAt = new Map([
+    [target, 1_000],
+    [filler, 10],
+  ]);
+  const encoder = new TextEncoder();
+  const oneEntrySize = encoder.encode(
+    JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: { [target]: 1 } }),
+  ).length;
+  const budget = oneEntrySize + 5; // fits one entry, not two
+
+  const { evicted, fitsAfterTrim } = trimContextsToBudget(
+    contexts,
+    CLIENT_ID,
+    budget,
+    sourceCreatedAt,
+  );
+  assert.equal(evicted, 1);
+  assert.equal(fitsAfterTrim, true);
+  assert.ok(target in contexts, "recently-affirmed marker must survive");
+  assert.ok(!(filler in contexts), "stale-source entry evicted first");
+});
+
+test("trimContextsToBudget_missingSource_fallsBackToMarkerTs", () => {
+  // Entries without a sourceCreatedAt record (legacy/seeded) order by marker
+  // value, preserving pre-recency behavior.
+  const older = `msg:${MSG_ID}`;
+  const newer = `msg:${"c".repeat(64)}`;
+  const contexts = { [older]: 1, [newer]: 500 };
+  const encoder = new TextEncoder();
+  const oneEntrySize = encoder.encode(
+    JSON.stringify({ v: 1, client_id: CLIENT_ID, contexts: { [older]: 1 } }),
+  ).length;
+  const budget = oneEntrySize + 5;
+
+  const { evicted } = trimContextsToBudget(
+    contexts,
+    CLIENT_ID,
+    budget,
+    new Map(),
+  );
+  assert.equal(evicted, 1);
+  assert.ok(!(older in contexts), "older marker evicted on fallback ordering");
+  assert.ok(newer in contexts);
+});
+
+test("trimContextsToBudget_msgTierBeforeThread_underRecencyKeying", () => {
+  // Tier order dominates recency: a recently-affirmed msg entry still evicts
+  // before a stale-source thread entry.
+  const msgKey = `msg:${MSG_ID}`;
+  const threadKeyLocal = `thread:${THREAD_ID}`;
+  const contexts = { [msgKey]: 1, [threadKeyLocal]: 2 };
+  const sourceCreatedAt = new Map([
+    [msgKey, 1_000],
+    [threadKeyLocal, 10],
+  ]);
+  const encoder = new TextEncoder();
+  const oneEntrySize = encoder.encode(
+    JSON.stringify({
+      v: 1,
+      client_id: CLIENT_ID,
+      contexts: { [threadKeyLocal]: 2 },
+    }),
+  ).length;
+  const budget = oneEntrySize + 5;
+
+  const { evicted } = trimContextsToBudget(
+    contexts,
+    CLIENT_ID,
+    budget,
+    sourceCreatedAt,
+  );
+  assert.equal(evicted, 1);
+  assert.ok(!(msgKey in contexts), "msg tier evicts first regardless of recency");
+  assert.ok(threadKeyLocal in contexts);
+});
+
 // ── splitContextsIntoBudgetedSlots ────────────────────────────────────────────
 
 // Build a channel key that is ~70 bytes in the JSON blob:
@@ -773,6 +858,96 @@ test("splitContextsIntoBudgetedSlots_threadMsgTrimmedWhenPrimarySlotOverBudget",
   // Slot 0 must fit within budget.
   const size = blobSize(CLIENT_ID, result.slots[0]);
   assert.ok(size <= budget, `slot 0 size ${size} exceeds budget ${budget}`);
+});
+
+test("splitContextsIntoBudgetedSlots_threadsSourceRecencyIntoPrimarySlotTrim", () => {
+  // The primary-slot trim must honor read-action recency: the old-marker but
+  // recently-affirmed msg entry survives; the stale-source one is evicted.
+  const channelEntries = [[makeChannelKey(1), 100]];
+  const survivor = makeMsgKey(1);
+  const stale = makeMsgKey(2);
+  const channelPlusOne = {
+    [makeChannelKey(1)]: 100,
+    [survivor]: 1,
+  };
+  const budget = blobSize(CLIENT_ID, channelPlusOne) + 5; // one msg entry fits
+
+  const result = splitContextsIntoBudgetedSlots({
+    channelEntries,
+    threadMsgEntries: [
+      [survivor, 1],
+      [stale, 500],
+    ],
+    clientId: CLIENT_ID,
+    initialSlotCount: 1,
+    maxSlots: 8,
+    maxBytes: budget,
+    slotIdGenerator: deterministicSlotId,
+    sourceCreatedAt: new Map([
+      [survivor, 1_000],
+      [stale, 10],
+    ]),
+  });
+
+  assert.ok(result !== null, "should succeed");
+  assert.ok(survivor in result.slots[0], "recently-affirmed msg key survives");
+  assert.ok(!(stale in result.slots[0]), "stale-source msg key evicted");
+});
+
+// ── ReadStateManager seam: hydrate → contextSourceCreatedAt → currentContexts ─
+
+test("currentContexts_keepsRecentlyAffirmedMarkerFromHydratedSource", () => {
+  // Binds the production wiring the recency fix lives in: source recency is
+  // hydrated from localStorage and must reach the currentContexts trim. If a
+  // caller stops passing this.contextSourceCreatedAt, this fails while the
+  // pure-function tests above still pass.
+  const storage = makeLocalStorage();
+  const pubkey = "6".repeat(64);
+
+  const target = makeMsgKey(9_999);
+  const contexts = { [target]: new Date(1_000).toISOString() }; // marker ts=1
+  const sources = { [target]: 2_000_000 }; // re-affirmed recently
+  const fillerKeys = [];
+  for (let i = 0; i < 700; i++) {
+    const key = makeMsgKey(i);
+    fillerKeys.push(key);
+    contexts[key] = new Date((500 + i) * 1_000).toISOString(); // newer markers
+    sources[key] = 100 + i; // stale read actions
+  }
+  storage.setItem(
+    `buzz.channel-read-state.v2:${pubkey}`,
+    JSON.stringify(contexts),
+  );
+  storage.setItem(
+    `buzz.channel-read-state.publishable.v1:${pubkey}`,
+    JSON.stringify([target, ...fillerKeys]),
+  );
+  storage.setItem(
+    `buzz.channel-read-state.source-created-at.v1:${pubkey}`,
+    JSON.stringify(sources),
+  );
+  globalThis.window.localStorage = storage;
+  const { restore } = withFakeTimers();
+  const manager = new ReadStateManager(pubkey, makeFakeRelay());
+
+  try {
+    manager.hydrateFromLocalStorage();
+    // 701 msg keys ≈ 50 KB — over the 32 KB budget, so the trim must run.
+    const published = manager.currentContexts();
+    assert.ok(published !== null, "msg-only blob always fits after trim");
+    assert.ok(
+      target in published,
+      "recently-affirmed old-marker entry must survive the publish trim",
+    );
+    const survivors = Object.keys(published).length;
+    assert.ok(
+      survivors < 701,
+      `trim must have evicted something (kept ${survivors})`,
+    );
+  } finally {
+    manager.destroy();
+    restore();
+  }
 });
 
 // ── ReadStateManager.publish — no-op suppression in split mode ────────────────

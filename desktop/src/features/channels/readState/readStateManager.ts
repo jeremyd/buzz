@@ -101,9 +101,14 @@ export function applyRemoteContextTimestamp(args: {
 
   if (result === "advanced") {
     effectiveState.set(contextId, next);
-  }
-  if (eventCreatedAt > sourceCreatedAt) {
-    contextSourceCreatedAt.set(contextId, eventCreatedAt);
+    // Source recency only refreshes on a genuine advance. An own-blob echo or
+    // refetch carries values we already hold ("unchanged") — bumping source
+    // there would flatten every blob-resident context to the blob's
+    // created_at each publish cycle, erasing the read-action recency that
+    // budget eviction and local pruning key on.
+    if (eventCreatedAt > sourceCreatedAt) {
+      contextSourceCreatedAt.set(contextId, eventCreatedAt);
+    }
   }
   return result;
 }
@@ -143,6 +148,7 @@ export function splitContextsIntoBudgetedSlots(args: {
   maxSlots: number;
   maxBytes: number;
   slotIdGenerator: () => string;
+  sourceCreatedAt?: ReadonlyMap<string, number>;
 }): SlotSplitResult | null {
   const {
     channelEntries,
@@ -152,6 +158,7 @@ export function splitContextsIntoBudgetedSlots(args: {
     maxSlots,
     maxBytes,
     slotIdGenerator,
+    sourceCreatedAt,
   } = args;
 
   const encoder = new TextEncoder();
@@ -192,7 +199,7 @@ export function splitContextsIntoBudgetedSlots(args: {
   for (const [key, ts] of threadMsgEntries) {
     slotContexts[0][key] = ts;
   }
-  trimContextsToBudget(slotContexts[0], clientId, maxBytes);
+  trimContextsToBudget(slotContexts[0], clientId, maxBytes, sourceCreatedAt);
 
   return { slots: slotContexts, extraSlotIds };
 }
@@ -209,9 +216,15 @@ export interface TrimResult {
 
 /**
  * Trim a contexts map to fit within `maxBytes` when serialized as the JSON
- * blob `{v:1, client_id, contexts}`. Evicts oldest `msg:` entries first
- * (lowest timestamp), then oldest `thread:` entries. Channel keys are never
- * evicted. Mutates `contexts` in place.
+ * blob `{v:1, client_id, contexts}`. Evicts `msg:` entries first, then
+ * `thread:` entries, each tier ordered by read-action recency
+ * (`sourceCreatedAt`, falling back to the marker value for legacy entries
+ * without one). Channel keys are never evicted. Mutates `contexts` in place.
+ *
+ * Recency — not the marker value — is the eviction key because an old-valued
+ * `msg:` marker can be the sole cover for an event newer than its channel and
+ * thread frontiers; evicting it by marker age resurrects that event as unread
+ * on every relay-state reader while the user keeps re-reading it locally.
  *
  * Returns `{ evicted, fitsAfterTrim }`. `fitsAfterTrim` is false when the
  * remaining blob (channel keys only) still exceeds `maxBytes` — the caller
@@ -223,6 +236,7 @@ export function trimContextsToBudget(
   contexts: Record<string, number>,
   clientId: string,
   maxBytes: number,
+  sourceCreatedAt?: ReadonlyMap<string, number>,
 ): TrimResult {
   const encoder = new TextEncoder();
   const blobFor = (c: Record<string, number>) =>
@@ -242,9 +256,15 @@ export function trimContextsToBudget(
       threadEntries.push([key, ts]);
     }
   }
-  // Oldest-first within each tier.
-  msgEntries.sort((a, b) => a[1] - b[1]);
-  threadEntries.sort((a, b) => a[1] - b[1]);
+  // Least-recently-affirmed first within each tier. Deterministic tie-breaks
+  // (marker value, then key) keep the survivor set stable across publish
+  // cycles so isIdenticalToLastPublished can suppress no-op republishes.
+  const recency = ([key, ts]: [string, number]) =>
+    sourceCreatedAt?.get(key) ?? ts;
+  const byRecency = (a: [string, number], b: [string, number]) =>
+    recency(a) - recency(b) || a[1] - b[1] || (a[0] < b[0] ? -1 : 1);
+  msgEntries.sort(byRecency);
+  threadEntries.sort(byRecency);
 
   // O(n) pass: subtract each entry's byte contribution from currentBytes and
   // collect entries to evict. The per-entry estimate is `,"key":timestamp`
@@ -722,11 +742,11 @@ export class ReadStateManager {
         `[ReadStateManager] publish accepted slotId=${slotId} createdAt=${createdAt}`,
       );
 
-      for (const key of Object.keys(contexts)) {
-        if (this.lastPublishedContexts[key] !== contexts[key]) {
-          this.contextSourceCreatedAt.set(key, createdAt);
-        }
-      }
+      // Publishing is not a read action: contextSourceCreatedAt is maintained
+      // by markContextRead and by genuinely-advancing remote merges only.
+      // Bumping it here re-flattened every published key's recency each cycle
+      // (all of them, in split mode, where lastPublishedContexts resets),
+      // which defeated recency-keyed budget eviction.
       // Merge this slot's contexts into lastPublishedContexts (union).
       for (const [key, ts] of Object.entries(contexts)) {
         this.lastPublishedContexts[key] = ts;
@@ -849,12 +869,13 @@ export class ReadStateManager {
     }
 
     // Byte-budget trim (reactive backstop).
-    // Evict oldest msg: then thread: entries until the blob fits 32 KB.
-    // Channel keys are never evicted here.
+    // Evict least-recently-affirmed msg: then thread: entries until the blob
+    // fits 32 KB. Channel keys are never evicted here.
     const { evicted, fitsAfterTrim } = trimContextsToBudget(
       contexts,
       this.clientId,
       READ_STATE_MAX_PLAINTEXT_BYTES,
+      this.contextSourceCreatedAt,
     );
     if (evicted > 0) {
       console.warn(
@@ -907,6 +928,7 @@ export class ReadStateManager {
       maxSlots: READ_STATE_MAX_SLOTS,
       maxBytes: READ_STATE_MAX_PLAINTEXT_BYTES,
       slotIdGenerator: () => generateHex(16),
+      sourceCreatedAt: this.contextSourceCreatedAt,
     });
 
     if (result === null) {
