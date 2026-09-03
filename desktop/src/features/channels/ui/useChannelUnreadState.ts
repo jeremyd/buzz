@@ -7,6 +7,7 @@ import {
   buildRepliesByRootId,
   collectReplyDescendantIds,
 } from "@/features/channels/lib/subtreeCreatedAt";
+import { computeThreadReadBoundary } from "@/features/channels/lib/threadReadBoundary";
 import { computeThreadReplyUnreadCounts } from "@/features/channels/lib/threadReplyUnreadCounts";
 import { computeThreadBadgeCounts } from "@/features/channels/lib/threadBadgeCounts";
 import {
@@ -36,6 +37,15 @@ type UseChannelUnreadStateOptions = {
   threadReplyTargetId: string | null;
   expandedThreadReplyIds: ReadonlySet<string>;
   openThreadMessages?: MainTimelineEntry[];
+  /**
+   * COMPLETE formatted message set for the open thread (head + every reply,
+   * revealed or collapsed), from the exhaustively-paged thread-replies query.
+   * Required for the thread-frontier advance below — visibleReplies is not
+   * complete and must never drive it.
+   */
+  openThreadAllMessages?: TimelineMessage[];
+  /** True only when the thread-replies query has settled successfully. */
+  openThreadRepliesComplete?: boolean;
   getChannelReadAt: (channelId: string) => number | null;
   getMessageReadAt: (messageId: string) => number | null;
   getThreadReadAt: (rootId: string, channelId?: string | null) => number | null;
@@ -45,6 +55,7 @@ type UseChannelUnreadStateOptions = {
   ) => void;
   markChannelUnread: (channelId: string) => void;
   markMessageRead: (messageId: string, timestamp: number) => void;
+  markThreadRead: (rootId: string, timestamp: number) => void;
   isThreadMuted: (rootId: string) => boolean;
   readStateVersion: number;
 };
@@ -69,12 +80,15 @@ export function useChannelUnreadState({
   threadReplyTargetId,
   expandedThreadReplyIds,
   openThreadMessages,
+  openThreadAllMessages,
+  openThreadRepliesComplete,
   getChannelReadAt,
   getMessageReadAt,
   getThreadReadAt,
   clearChannelUnreadSource,
   markChannelUnread,
   markMessageRead,
+  markThreadRead,
   isThreadMuted,
   readStateVersion,
 }: UseChannelUnreadStateOptions) {
@@ -299,6 +313,57 @@ export function useChannelUnreadState({
       markMessageRead(entry.message.id, entry.message.createdAt);
     }
   }, [openThreadHeadId, threadMessages, markMessageRead, isThreadMuted]);
+  // Advance the aggregate `thread:<root>` frontier to the maximal safe
+  // boundary: max reply createdAt when every reply is read, else
+  // min(unread createdAt) - 1 so collapsed-unread branches stay unread
+  // (LP4 v3) while msg: markers keep covering newer read replies. The
+  // aggregate is the durable cover — per-message markers are evictable from
+  // the published blob under budget pressure, and without an advanced
+  // thread: marker their loss resurrects the reply as unread on every
+  // relay-state reader. Declared AFTER the on-open mark-read effect so it
+  // observes the fresh msg: markers in the same commit (the manager advances
+  // synchronously). Only runs on the COMPLETE reply set (query settled, true
+  // root): advancing over a partially-loaded thread could cover an unloaded
+  // unread reply. Grow-only + domination guard: never writes when the
+  // effective frontier already covers the boundary, so no junk thread: keys,
+  // no publish churn, and no effect loop (a self-triggered readStateVersion
+  // bump recomputes the same boundary and exits).
+  // biome-ignore lint/correctness/useExhaustiveDependencies: readStateVersion and forcedUnreadVersion are intentional recompute triggers
+  React.useEffect(() => {
+    const rootId = openThreadHeadId;
+    if (!rootId || !openThreadRepliesComplete) return;
+    if (isThreadMuted(rootId)) return;
+    const allMessages = openThreadAllMessages ?? [];
+    const head =
+      allMessages.find((message) => message.id === rootId) ??
+      messageById.get(rootId);
+    if (!head) return;
+    if (head.rootId && head.rootId !== rootId) return;
+    const boundary = computeThreadReadBoundary({
+      replies: allMessages.filter((message) => message.id !== rootId),
+      getReadAt: getThreadAwareReadAt,
+      currentPubkey,
+      isForcedUnread: isMsgForcedUnread,
+    });
+    if (boundary === null) return;
+    const effectiveThreadReadAt = getThreadReadAt(rootId, activeChannelId) ?? 0;
+    if (boundary <= effectiveThreadReadAt) return;
+    markThreadRead(rootId, boundary);
+  }, [
+    activeChannelId,
+    currentPubkey,
+    getThreadAwareReadAt,
+    getThreadReadAt,
+    isMsgForcedUnread,
+    isThreadMuted,
+    markThreadRead,
+    messageById,
+    openThreadAllMessages,
+    openThreadHeadId,
+    openThreadRepliesComplete,
+    readStateVersion,
+    forcedUnreadVersion,
+  ]);
   // In-thread "New" divider position. Reads the open-time snapshot (frozen
   // before the mark-read effect above), so the divider does not collapse the
   // instant open marks the revealed replies read. A reply absent from the

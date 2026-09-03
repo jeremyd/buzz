@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { computeThreadBadgeCounts } from "./threadBadgeCounts.ts";
+import { computeThreadReadBoundary } from "./threadReadBoundary.ts";
 import { buildRepliesByRootId } from "./subtreeCreatedAt.ts";
 
 // Open-at-level contract (LP4 v3). Opening a thread no longer collapses the
@@ -99,6 +100,46 @@ test("newerReplyAfterOpen_relightsRootBadge", () => {
   ];
   // Only a was present/revealed at open; b is unread (never marked).
   assert.equal(rootBadge(messages, openMarksRevealed(messages, ["a"])), 1);
+});
+
+test("boundaryAdvanceThenMsgEviction_coveredBranchesStayClear", () => {
+  // The eviction-resurrection regression, end to end at the badge seam:
+  // open reveals branch a (a, a1) while branch c stays collapsed. The
+  // boundary-advance effect then advances thread:root to min(unread)-1, and
+  // budget pressure later evicts the revealed replies' msg: markers. With
+  // the aggregate folded into the resolver (the production fold), the
+  // covered branch stays clear and ONLY the collapsed-unread branch is lit.
+  const messages = [
+    msg("root", null, 50),
+    msg("a", "root", 100),
+    msg("a1", "a", 110, "author", "root"),
+    msg("c", "root", 120),
+    msg("c1", "c", 130, "author", "root"),
+  ];
+  const afterOpen = openMarksRevealed(messages, ["a", "a1"]);
+  const boundary = computeThreadReadBoundary({
+    replies: messages.filter((m) => m.id !== "root"),
+    getReadAt: afterOpen,
+  });
+  // First unread is c(120) → boundary 119 covers a(100) and a1(110).
+  assert.equal(boundary, 119);
+
+  // Every msg: marker below the boundary is dominated and evicted; the
+  // resolver folds only the surviving aggregate.
+  const foldedAfterEviction = (id) => {
+    const own = afterOpen(id);
+    const dominated = own !== null && own <= boundary;
+    return Math.max(dominated ? 0 : (own ?? 0), boundary) || null;
+  };
+  assert.equal(rootBadge(messages, foldedAfterEviction), 2);
+
+  // Without the boundary advance, the same eviction resurrects the read
+  // branch: all four replies light up again — the bug this guards against.
+  const evictedWithoutBoundary = (id) => {
+    const own = afterOpen(id);
+    return own !== null && own <= boundary ? null : own;
+  };
+  assert.equal(rootBadge(messages, evictedWithoutBoundary), 4);
 });
 
 test("openThreadWhereOnlyUnreadIsOwnReply_neverShowsBadge", () => {
