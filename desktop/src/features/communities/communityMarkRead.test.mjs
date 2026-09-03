@@ -158,6 +158,111 @@ test("publishCommunityReadState skips archived channels and publishes nothing wh
   assert.equal(client.published.length, 0);
 });
 
+// ── Rail mark-all-read covers thread-reply-only unread (regression) ──────────
+
+const OTHER_PUBKEY = "b".repeat(64);
+const THREAD_ROOT = "c".repeat(64);
+
+// Stateful fake relay binding fetchCommunityUnread and
+// publishCommunityReadState to the SAME store: read-state events published by
+// the rail feed straight back into the observer's next poll, modeling the
+// relay round-trip. `since` is honored on message fetches — a covered channel
+// manifests exactly as the relay returning nothing past the marker.
+function statefulClient({ channelIds, metadata, channelEvents }) {
+  const published = [];
+  return {
+    published,
+    async fetchEvents(filter) {
+      if (filter.kinds?.includes(39002)) return [membersEvent(channelIds)];
+      if (filter.kinds?.includes(39000)) return metadata;
+      if (filter["#t"]?.includes("read-state")) {
+        return published.filter(
+          (event) => event.created_at >= (filter.since ?? 0),
+        );
+      }
+      if (filter["#d"]?.includes("channel-mutes")) return [];
+      if (filter["#h"] && !filter["#p"]) {
+        return channelEvents.filter(
+          (event) =>
+            filter["#h"].includes(
+              event.tags.find((tag) => tag[0] === "h")?.[1],
+            ) && event.created_at >= (filter.since ?? 0),
+        );
+      }
+      return [];
+    },
+    async publishEvent(event) {
+      published.push(event);
+    },
+  };
+}
+
+test("markAllRead covers a channel whose only unread is a thread reply", async () => {
+  const { fetchCommunityUnread } = await import("./communityUnreadObserver.ts");
+  const replyAt = READ_AT;
+  const threadReply = {
+    id: "reply".padEnd(64, "0"),
+    pubkey: OTHER_PUBKEY,
+    created_at: replyAt,
+    kind: 9,
+    tags: [
+      ["h", "chan-1"],
+      ["e", THREAD_ROOT, "", "root"],
+      ["e", "parent".padEnd(64, "0"), "", "reply"],
+    ],
+    content: "buzz link pls?",
+    sig: "sig",
+  };
+  const client = statefulClient({
+    channelIds: ["chan-1"],
+    metadata: [metadataEvent("chan-1")],
+    channelEvents: [threadReply],
+  });
+  const observerArgs = {
+    client,
+    pubkey: PUBKEY,
+    nowSeconds: replyAt + 20,
+    decryptReadState: async (ciphertext) => ciphertext,
+    decryptMutes: async (ciphertext) => ciphertext,
+    // The user participated in the thread, so the reply passes the notify
+    // gate — the exact shape of the stuck-badge repro.
+    readThreadRelationships: () => ({
+      participatedRootIds: new Set([THREAD_ROOT]),
+      followedRootIds: new Set(),
+      authoredRootIds: new Set(),
+      mutedRootIds: new Set(),
+    }),
+    readForcedUnread: () => ({}),
+  };
+
+  const before = await fetchCommunityUnread(observerArgs);
+  assert.equal(before.hasUnread, true, "thread reply lights the rail dot");
+
+  await publishCommunityReadState({
+    client,
+    pubkey: PUBKEY,
+    relayUrl: "wss://relay.example",
+    nowSeconds: replyAt + 10,
+    encrypt: async (plaintext) => plaintext,
+    sign: async (input) => ({
+      id: "signed".padEnd(64, "0"),
+      pubkey: PUBKEY,
+      created_at: input.createdAt,
+      kind: input.kind,
+      tags: input.tags,
+      content: input.content,
+      sig: "sig",
+    }),
+  });
+
+  const after = await fetchCommunityUnread(observerArgs);
+  assert.deepEqual(
+    after,
+    { hasUnread: false, mentionCount: 0 },
+    "the {channel: now} marker covers the thread reply via the hierarchical fold",
+  );
+});
+
 test("publishCommunityReadState reuses stable slot ids so blobs are replaceable", async () => {
   const makeArgs = (client) => ({
     client,

@@ -234,6 +234,14 @@ child context's effective frontier. Clients MAY drop such dominated entries
 before publishing to bound blob size, consistent with the Debounce and Pruning
 section.
 
+When a byte-budget forces eviction of entries that are NOT dominated, clients
+SHOULD order eviction by read-action recency (when the entry last genuinely
+advanced) rather than by the entry's marker value: an old-valued `msg:` entry
+can be the sole cover for an event newer than its channel and thread
+frontiers, and evicting it by marker age resurrects that event as unread on
+every reader of the published state. (Non-normative; this is the intended
+reading of "prioritizing recently-active contexts" in Debounce and Pruning.)
+
 This eviction is bounded best-effort, NOT a guaranteed garbage-collection or
 per-key tombstone mechanism. Because the merge rule re-merges any context
 present in another instance's blob (see Merge Rule and Live Subscription and
