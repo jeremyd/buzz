@@ -686,7 +686,10 @@ test("trimContextsToBudget_msgTierBeforeThread_underRecencyKeying", () => {
     sourceCreatedAt,
   );
   assert.equal(evicted, 1);
-  assert.ok(!(msgKey in contexts), "msg tier evicts first regardless of recency");
+  assert.ok(
+    !(msgKey in contexts),
+    "msg tier evicts first regardless of recency",
+  );
   assert.ok(threadKeyLocal in contexts);
 });
 
