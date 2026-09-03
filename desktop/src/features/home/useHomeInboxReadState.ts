@@ -1,6 +1,7 @@
 import * as React from "react";
 
 import type { ForcedUnreadSource } from "@/features/channels/forcedUnreadStore";
+import { maxReadAt } from "@/features/channels/readState/readStateFormat";
 import type { InboxItem } from "@/features/home/lib/inbox";
 import {
   getThreadReference,
@@ -124,10 +125,16 @@ export function resolveInboxItemReadAt(
   const channelId = item.item.channelId;
   const threadRootId = getInboxThreadRootId(item);
   if (threadRootId) {
+    // Fold the per-message and thread frontiers: a thread-covered reply must
+    // read as done even when its msg: marker was evicted from the published
+    // blob (only the aggregate thread: marker survives budget trims durably),
+    // and a per-message read must count even before the thread aggregate
+    // advances.
+    const threadReadAt = options.getThreadReadAt(threadRootId, channelId);
     if (options.getMessageReadAt) {
-      return options.getMessageReadAt(item.item.id);
+      return maxReadAt(options.getMessageReadAt(item.item.id), threadReadAt);
     }
-    return options.getThreadReadAt(threadRootId, channelId);
+    return threadReadAt;
   }
 
   return channelId ? options.getChannelReadAt(channelId) : null;

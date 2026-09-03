@@ -28,3 +28,27 @@ test("channel activity read state honors a channel marker without a message mark
     300,
   );
 });
+
+test("channel activity read state folds the thread marker for thread replies", () => {
+  // Regression: the reply's msg: marker was budget-evicted, but the thread
+  // aggregate covers it — the activity row must not resurrect as unread.
+  const markers = new Map([
+    ["thread:root-event", 400],
+    ["general", 200],
+  ]);
+
+  assert.equal(
+    resolveChannelActivityFeedItemReadAt(
+      {
+        id: "reply-general",
+        channelId: "general",
+        tags: [
+          ["e", "root-event", "", "root"],
+          ["e", "parent-event", "", "reply"],
+        ],
+      },
+      (contextId) => markers.get(contextId) ?? null,
+    ),
+    400,
+  );
+});

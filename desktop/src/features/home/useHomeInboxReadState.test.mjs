@@ -210,7 +210,33 @@ test("thread inbox row read state includes per-message marker", () => {
   );
 });
 
-test("thread inbox row read state follows the per-message marker", () => {
+test("thread inbox row read state folds the per-message and thread markers", () => {
+  const replyItem = feedItem({
+    id: "reply-event",
+    createdAt: 200,
+    tags: [
+      ["h", CHANNEL_ID],
+      ["e", "root-event", "", "root"],
+      ["e", "parent-event", "", "reply"],
+    ],
+  });
+
+  // The thread aggregate is ahead of the per-message marker: max wins. The
+  // old msg-only bypass returned 200 here, resurrecting thread-covered
+  // replies whose msg: marker had been evicted from the published blob.
+  assert.equal(
+    resolveInboxItemReadAt(inboxItem([replyItem]), {
+      getChannelReadAt: () => 100,
+      getThreadReadAt: () => 250,
+      getMessageReadAt: () => 200,
+    }),
+    250,
+  );
+});
+
+test("thread inbox row stays read via the thread marker after msg eviction", () => {
+  // Regression: the msg: marker is gone (budget-evicted) but the thread
+  // aggregate covers the reply — the row must not resurrect as unread.
   const replyItem = feedItem({
     id: "reply-event",
     createdAt: 200,
@@ -224,10 +250,10 @@ test("thread inbox row read state follows the per-message marker", () => {
   assert.equal(
     resolveInboxItemReadAt(inboxItem([replyItem]), {
       getChannelReadAt: () => 100,
-      getThreadReadAt: () => 250,
-      getMessageReadAt: () => 200,
+      getThreadReadAt: (rootId) => (rootId === "root-event" ? 300 : null),
+      getMessageReadAt: () => null,
     }),
-    200,
+    300,
   );
 });
 

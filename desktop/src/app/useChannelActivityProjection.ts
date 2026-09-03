@@ -6,7 +6,10 @@ import {
   msgContextKey,
 } from "@/features/channels/readState/readStateFormat";
 import type { ThreadActivityItem } from "@/features/channels/useUnreadChannels";
-import { isThreadReply } from "@/features/messages/lib/threading";
+import {
+  getThreadReference,
+  isThreadReply,
+} from "@/features/messages/lib/threading";
 import type { Channel, FeedItem, HomeFeed } from "@/shared/api/types";
 
 type ReadTimestamp = (contextKey: string) => number | null;
@@ -29,11 +32,16 @@ type UseChannelActivityProjectionOptions = {
 };
 
 export function resolveChannelActivityFeedItemReadAt(
-  item: Pick<FeedItem, "channelId" | "id">,
+  item: Pick<FeedItem, "channelId" | "id" | "tags">,
   getOwnReadAt: ReadTimestamp,
 ): number | null {
+  // Fold thread: alongside msg: and the channel marker — a thread-covered
+  // reply must not resurrect in the activity feed when its evicted msg:
+  // marker is gone (the thread aggregate is the durable cover).
+  const rootId = getThreadReference(item.tags ?? []).rootId;
   return maxReadAt(
     getOwnReadAt(msgContextKey(item.id)),
+    rootId ? getOwnReadAt(`thread:${rootId}`) : null,
     item.channelId ? getOwnReadAt(item.channelId) : null,
   );
 }
@@ -74,7 +82,7 @@ export function useChannelActivityProjection({
     [getChannelReadAt],
   );
   const getChannelActivityItemReadAt = React.useCallback(
-    (item: Pick<FeedItem, "channelId" | "id">) =>
+    (item: Pick<FeedItem, "channelId" | "id" | "tags">) =>
       resolveChannelActivityFeedItemReadAt(item, getOwnReadAt),
     [getOwnReadAt],
   );

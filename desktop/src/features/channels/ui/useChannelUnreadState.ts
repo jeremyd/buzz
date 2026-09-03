@@ -18,6 +18,7 @@ import {
   buildThreadPanelIndex,
   type MainTimelineEntry,
 } from "@/features/messages/lib/threadPanel";
+import { maxReadAt } from "@/features/channels/readState/readStateFormat";
 import {
   computeChannelUnreadMarker,
   computeThreadUnreadMarker,
@@ -37,6 +38,7 @@ type UseChannelUnreadStateOptions = {
   openThreadMessages?: MainTimelineEntry[];
   getChannelReadAt: (channelId: string) => number | null;
   getMessageReadAt: (messageId: string) => number | null;
+  getThreadReadAt: (rootId: string, channelId?: string | null) => number | null;
   clearChannelUnreadSource: (
     channelId: string,
     source: ForcedUnreadSource,
@@ -69,6 +71,7 @@ export function useChannelUnreadState({
   openThreadMessages,
   getChannelReadAt,
   getMessageReadAt,
+  getThreadReadAt,
   clearChannelUnreadSource,
   markChannelUnread,
   markMessageRead,
@@ -167,6 +170,23 @@ export function useChannelUnreadState({
     () => new Map(timelineMessages.map((message) => [message.id, message])),
     [timelineMessages],
   );
+  // Per-message read resolver with the thread frontier folded in:
+  // effective(reply) = max(effective(msg:<id>), thread:<rootId>). The channel
+  // term is already folded into getMessageReadAt by the parent resolver, so
+  // the thread term uses the OWN marker only (channelId omitted) to avoid
+  // double-folding drift. Without this fold a thread-covered reply whose
+  // evicted msg: marker is gone would resurrect unread here while the rail
+  // observer, native projection, and mobile — which all fold thread: — say
+  // read.
+  const getThreadAwareReadAt = React.useCallback(
+    (messageId: string): number | null => {
+      const own = getMessageReadAt(messageId);
+      const rootId = messageById.get(messageId)?.rootId ?? null;
+      if (!rootId) return own;
+      return maxReadAt(own, getThreadReadAt(rootId, null));
+    },
+    [getMessageReadAt, getThreadReadAt, messageById],
+  );
   const threadPanelIndex = React.useMemo(
     () => buildThreadPanelIndex(timelineMessages),
     [timelineMessages],
@@ -243,10 +263,10 @@ export function useChannelUnreadState({
         threadOpenReadSnapshotRef.current.set(openThreadHeadId, snapshot);
       }
       if (!snapshot.has(replyId)) {
-        snapshot.set(replyId, getMessageReadAt(replyId));
+        snapshot.set(replyId, getThreadAwareReadAt(replyId));
       }
     },
-    [getMessageReadAt, openThreadHeadId],
+    [getThreadAwareReadAt, openThreadHeadId],
   );
   if (openThreadHeadId) {
     // Capture each visible reply's read state the first render it appears —
@@ -300,13 +320,13 @@ export function useChannelUnreadState({
       (replyId) =>
         snapshot?.has(replyId)
           ? (snapshot.get(replyId) ?? null)
-          : getMessageReadAt(replyId),
+          : getThreadAwareReadAt(replyId),
       currentPubkey,
     );
-  }, [currentPubkey, getMessageReadAt, openThreadHeadId, threadMessages]);
+  }, [currentPubkey, getThreadAwareReadAt, openThreadHeadId, threadMessages]);
   // Per-row subtree unread counts for the in-panel thread summary rows. Scoped
   // to the open thread's subtree and decided per-reply against the live
-  // per-message read state (getMessageReadAt): each collapsed row's badge
+  // per-message read state (getThreadAwareReadAt): each collapsed row's badge
   // counts unread replies anywhere beneath it. Expanding a branch marks only
   // its revealed direct children read, so a collapsed grandchild keeps its
   // badge — the per-message marker distinguishes the read parent from the
@@ -322,7 +342,7 @@ export function useChannelUnreadState({
             subtreeReplyIds: getReplyDescendantIdsForMessage(openThreadHeadId),
             visibleReplyIds: threadMessages.map((entry) => entry.message.id),
             expandedReplyIds: expandedThreadReplyIds,
-            getReadAt: getMessageReadAt,
+            getReadAt: getThreadAwareReadAt,
             currentPubkey,
             isForcedUnread: isMsgForcedUnread,
           })
@@ -331,7 +351,7 @@ export function useChannelUnreadState({
       openThreadHeadId,
       threadMessages,
       timelineMessages,
-      getMessageReadAt,
+      getThreadAwareReadAt,
       expandedThreadReplyIds,
       getReplyDescendantIdsForMessage,
       currentPubkey,
@@ -352,7 +372,7 @@ export function useChannelUnreadState({
       computeThreadBadgeCounts(
         timelineMessages,
         repliesByRootId,
-        getMessageReadAt,
+        getThreadAwareReadAt,
         (rootId) => !isThreadMuted(rootId),
         currentPubkey,
         isMsgForcedUnread,
@@ -361,7 +381,7 @@ export function useChannelUnreadState({
       currentPubkey,
       timelineMessages,
       repliesByRootId,
-      getMessageReadAt,
+      getThreadAwareReadAt,
       isThreadMuted,
       isMsgForcedUnread,
       readStateVersion,
@@ -392,7 +412,7 @@ export function useChannelUnreadState({
       if (!message) return false;
       const { firstUnreadReplyId } = computeThreadUnreadMarker(
         [message],
-        getMessageReadAt,
+        getThreadAwareReadAt,
         currentPubkey,
         isMsgForcedUnread,
       );
@@ -400,7 +420,7 @@ export function useChannelUnreadState({
     },
     [
       messageById,
-      getMessageReadAt,
+      getThreadAwareReadAt,
       currentPubkey,
       isMsgForcedUnread,
       readStateVersion,
