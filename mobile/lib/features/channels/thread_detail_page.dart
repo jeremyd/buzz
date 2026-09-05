@@ -41,8 +41,10 @@ import 'message_action_backdrop_state.dart';
 import 'message_long_press_region.dart';
 import 'message_content.dart';
 import 'reaction_row.dart';
+import '../../shared/read_state/message_read_state.dart';
 import '../../shared/read_state/read_state_format.dart';
 import '../../shared/read_state/read_state_provider.dart';
+import '../../shared/read_state/thread_read_boundary.dart';
 import 'send_message_provider.dart';
 import 'small_avatar.dart';
 import 'sticky_date_header.dart';
@@ -693,6 +695,67 @@ class ThreadDetailPage extends HookConsumerWidget {
       });
       return null;
     }, [threadHead.id, readState.isReady, visibleReplyReadKey]);
+
+    // Advance the aggregate `thread:<root>` frontier to the maximal safe
+    // boundary (desktop 89c78c5ca parity): max reply createdAt when every
+    // subtree reply is read, else min(unread createdAt) - 1. The aggregate is
+    // the durable cover — per-message `msg:` markers are evictable from the
+    // published blob under byte-budget pressure, and without an advanced
+    // `thread:` marker their loss resurrects the reply as unread on every
+    // relay-state reader. Gated on the relay's exhaustively-paged subtree
+    // (`relayRepliesAvailable`) — advancing over a partial set could cover an
+    // unloaded unread reply — and evaluated over the FULL subtree of the
+    // outermost root, not just this page's visible branch. Grow-only: never
+    // writes when the effective thread/channel frontier already covers the
+    // boundary, so no junk keys, no publish churn, and no effect loop.
+    final subtreeReplies = [
+      for (final message in allMsgs)
+        if (message.rootId == queryRootId) message,
+    ];
+    final subtreeReadKey = subtreeReplies
+        .map((message) => '${message.id}:${message.createdAt}')
+        .join(',');
+    useEffect(() {
+      if (!readState.isReady || !relayRepliesAvailable) return null;
+      if (subtreeReplies.isEmpty) return null;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        // Read fresh state: the per-reply mark loop above runs in the same
+        // post-frame pass (registered first), so its msg: advances are
+        // already visible here.
+        final state = ref.read(readStateProvider);
+        final boundary = computeThreadReadBoundary(
+          replies: [
+            for (final message in subtreeReplies)
+              (
+                id: message.id,
+                createdAt: message.createdAt,
+                pubkey: message.pubkey,
+              ),
+          ],
+          getReadAt: (messageId) => effectiveMessageReadAt(
+            state,
+            channelId: channelId,
+            messageId: messageId,
+            threadRootId: queryRootId,
+          ),
+          currentPubkey: currentPubkey,
+          isForcedUnread: (messageId) =>
+              state.isForcedUnread(msgContextKey(messageId)),
+        );
+        if (boundary == null) return;
+        final effectiveThreadReadAt =
+            maxReadAt([
+              state.effectiveTimestamp(threadContextKey(queryRootId)),
+              state.effectiveTimestamp(channelId),
+            ]) ??
+            0;
+        if (boundary <= effectiveThreadReadAt) return;
+        ref
+            .read(readStateProvider.notifier)
+            .markContextRead(threadContextKey(queryRootId), boundary);
+      });
+      return null;
+    }, [threadHead.id, readState, relayRepliesAvailable, subtreeReadKey]);
 
     // Thread-scoped typing indicators (exclude self).
     final allTyping = ref.watch(channelTypingProvider(channelId));

@@ -39,6 +39,7 @@ import 'package:buzz/features/channels/thread_detail_page.dart';
 import 'package:buzz/features/channels/thread_replies_provider.dart';
 import 'package:buzz/features/channels/timeline_message.dart';
 import 'package:buzz/features/channels/channels_provider.dart';
+import 'package:buzz/shared/read_state/read_state_format.dart';
 import 'package:buzz/shared/read_state/read_state_provider.dart';
 import 'package:buzz/features/channels/unread_badge/observed_unread_event.dart';
 import 'package:buzz/features/channels/small_avatar.dart';
@@ -1879,6 +1880,154 @@ void main() {
       expect(readState.markedContexts, {_channelId: 1200});
       expect(tester.takeException(), isNull);
     });
+
+    testWidgets('opening a thread advances the thread: aggregate marker', (
+      tester,
+    ) async {
+      final readState = _SynchronousReadStateNotifier(
+        const ReadStateState(
+          isReady: true,
+          pubkey: 'self',
+          contexts: {},
+          version: 0,
+        ),
+      );
+      final rootEvent = _textMsg(
+        id: 'thread-root',
+        pubkey: 'alice',
+        content: 'Root',
+        createdAt: 1000,
+      );
+      final replies = [
+        for (var i = 0; i < 3; i++)
+          _textMsg(
+            id: 'reply-$i',
+            pubkey: 'bob',
+            content: 'Reply $i',
+            createdAt: 1100 + i,
+            extraTags: const [
+              ['e', 'thread-root', '', 'reply'],
+            ],
+          ),
+      ];
+
+      await tester.pumpWidget(
+        _buildTestable(
+          messages: [rootEvent],
+          threadReplies: {'thread-root': replies},
+          readStateNotifier: readState,
+          users: const {
+            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+          },
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      final threadHead = formatTimeline([rootEvent]).single;
+      Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+        MaterialPageRoute<void>(
+          builder: (_) => ThreadDetailPage(
+            threadHead: threadHead,
+            allMessages: [threadHead],
+            channelId: _channelId,
+            currentPubkey: 'self',
+            isMember: true,
+            isArchived: false,
+            initialMessageId: null,
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Every subtree reply is revealed and marked read on open, so the
+      // aggregate advances to the max reply createdAt. This is the durable
+      // cover for the per-reply msg: markers, which are evictable from the
+      // published blob under byte-budget pressure.
+      expect(readState.markedContexts[threadContextKey('thread-root')], 1102);
+    });
+
+    testWidgets(
+      'an unread nested branch holds the thread: aggregate below itself',
+      (tester) async {
+        final readState = _SynchronousReadStateNotifier(
+          const ReadStateState(
+            isReady: true,
+            pubkey: 'self',
+            contexts: {},
+            version: 0,
+          ),
+        );
+        final rootEvent = _textMsg(
+          id: 'thread-root',
+          pubkey: 'alice',
+          content: 'Root',
+          createdAt: 1000,
+        );
+        final replies = [
+          for (var i = 0; i < 3; i++)
+            _textMsg(
+              id: 'reply-$i',
+              pubkey: 'bob',
+              content: 'Reply $i',
+              createdAt: 1100 + i,
+              extraTags: const [
+                ['e', 'thread-root', '', 'reply'],
+              ],
+            ),
+          // Nested under reply-0 — not a direct child of the head, so opening
+          // the page does not reveal or mark it. The aggregate must stop
+          // below it.
+          _textMsg(
+            id: 'nested-unread',
+            pubkey: 'bob',
+            content: 'Nested',
+            createdAt: 1105,
+            extraTags: const [
+              ['e', 'thread-root', '', 'root'],
+              ['e', 'reply-0', '', 'reply'],
+            ],
+          ),
+        ];
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: [rootEvent],
+            threadReplies: {'thread-root': replies},
+            readStateNotifier: readState,
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+              'bob': UserProfile(pubkey: 'bob', displayName: 'Bob'),
+            },
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        final threadHead = formatTimeline([rootEvent]).single;
+        Navigator.of(tester.element(find.byType(ChannelDetailPage))).push(
+          MaterialPageRoute<void>(
+            builder: (_) => ThreadDetailPage(
+              threadHead: threadHead,
+              allMessages: [threadHead],
+              channelId: _channelId,
+              currentPubkey: 'self',
+              isMember: true,
+              isArchived: false,
+              initialMessageId: null,
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          readState.markedContexts[threadContextKey('thread-root')],
+          1104,
+          reason:
+              'boundary is min(unread createdAt) - 1 — the unread nested '
+              'reply must stay uncovered',
+        );
+      },
+    );
 
     testWidgets('shows forum posts view for forum channels', (tester) async {
       final forumChannel = Channel(
