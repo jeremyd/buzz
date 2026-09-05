@@ -61,8 +61,28 @@ export function isMsgContextKey(value: string): value is `msg:${string}` {
   return EVENT_ID_PATTERN.test(value.slice(MSG_PREFIX.length));
 }
 
+/**
+ * Recorded parent coordinates for a `msg:`/`thread:` context, captured at mark
+ * time from the event graph (the publish path has no graph access of its own).
+ * Powers the dominated-marker GC (NIP-RS "Dominated entries"): a marker whose
+ * value is covered by its parent frontier in the SAME outgoing blob is
+ * semantically inert and safe to drop before the byte-budget trim.
+ */
+export interface ContextParent {
+  /** Channel id the context belongs to. */
+  c: string;
+  /** Thread root event id for `msg:` contexts inside a thread; null for
+   * top-level messages and for `thread:` contexts (their parent is the
+   * channel alone). */
+  r: string | null;
+}
+
 export function localReadStateKey(pubkey: string): string {
   return `buzz.channel-read-state.v2:${pubkey}`;
+}
+
+export function localContextParentsKey(pubkey: string): string {
+  return `buzz.channel-read-state.parents.v1:${pubkey}`;
 }
 
 export function localPublishableContextKey(pubkey: string): string {

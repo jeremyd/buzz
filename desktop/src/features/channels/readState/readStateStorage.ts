@@ -1,5 +1,7 @@
 import {
+  type ContextParent,
   isPlainRecord,
+  localContextParentsKey,
   localIsoToUnixSeconds,
   localPublishableContextKey,
   localReadStateKey,
@@ -15,6 +17,7 @@ export type StoredReadState = {
   contexts: Map<string, number>;
   publishableContextIds: Set<string>;
   contextSourceCreatedAt: Map<string, number>;
+  contextParents: Map<string, ContextParent>;
 };
 
 function mergeLocalStorageKey(
@@ -92,6 +95,32 @@ function readContextSourceCreatedAt(pubkey: string): Map<string, number> {
   return result;
 }
 
+function readContextParents(pubkey: string): Map<string, ContextParent> {
+  const result = new Map<string, ContextParent>();
+  const raw = localStorage.getItem(localContextParentsKey(pubkey));
+  if (!raw) return result;
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!isPlainRecord(parsed)) return result;
+
+    for (const [contextId, value] of Object.entries(parsed)) {
+      if (!isPlainRecord(value)) continue;
+      if (typeof value.c !== "string" || value.c.length === 0) continue;
+      if (value.r !== null && typeof value.r !== "string") continue;
+      result.set(contextId, { c: value.c, r: value.r });
+    }
+  } catch (error) {
+    console.debug(
+      "[ReadStateManager] storage: contextParents JSON corrupt:",
+      error,
+    );
+    // Corrupt localStorage, ignore.
+  }
+
+  return result;
+}
+
 export function readStoredReadState(pubkey: string): StoredReadState {
   const contexts = new Map<string, number>();
   mergeLocalStorageKey(contexts, localReadStateKey(pubkey));
@@ -100,6 +129,7 @@ export function readStoredReadState(pubkey: string): StoredReadState {
     contexts,
     publishableContextIds: readPublishableContextIds(pubkey),
     contextSourceCreatedAt: readContextSourceCreatedAt(pubkey),
+    contextParents: readContextParents(pubkey),
   };
 }
 
@@ -161,6 +191,7 @@ export function writeStoredReadState(
   contexts: ReadonlyMap<string, number>,
   publishableContextIds: ReadonlySet<string>,
   contextSourceCreatedAt: ReadonlyMap<string, number>,
+  contextParents?: ReadonlyMap<string, ContextParent>,
 ): void {
   const pruned = pruneStaleContexts(
     contexts,
@@ -192,4 +223,19 @@ export function writeStoredReadState(
     localSourceCreatedAtKey(pubkey),
     JSON.stringify(sourceState),
   );
+
+  // Parents piggyback on the pruned context set, so the map stays bounded by
+  // LOCAL_MAX_PRUNABLE_CONTEXTS like every other per-context table.
+  if (contextParents) {
+    const parentState: Record<string, ContextParent> = {};
+    for (const [contextId, parent] of contextParents) {
+      if (pruned.has(contextId)) {
+        parentState[contextId] = parent;
+      }
+    }
+    setLocalStorageItemWithRecovery(
+      localContextParentsKey(pubkey),
+      JSON.stringify(parentState),
+    );
+  }
 }

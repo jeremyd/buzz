@@ -54,8 +54,16 @@ type UseChannelUnreadStateOptions = {
     source: ForcedUnreadSource,
   ) => void;
   markChannelUnread: (channelId: string) => void;
-  markMessageRead: (messageId: string, timestamp: number) => void;
-  markThreadRead: (rootId: string, timestamp: number) => void;
+  markMessageRead: (
+    messageId: string,
+    timestamp: number,
+    parent?: { channelId: string; rootId: string | null },
+  ) => void;
+  markThreadRead: (
+    rootId: string,
+    timestamp: number,
+    channelId?: string | null,
+  ) => void;
   isThreadMuted: (rootId: string) => boolean;
   readStateVersion: number;
 };
@@ -201,6 +209,27 @@ export function useChannelUnreadState({
     },
     [getMessageReadAt, getThreadReadAt, messageById],
   );
+  // Parent coordinates for a msg: marker written from this channel surface —
+  // recorded alongside the mark so the publish-path dominated-marker GC can
+  // judge it against the right channel/thread frontier. A message known to the
+  // timeline uses its own rootId (null for top-level — never borrow the open
+  // thread's root, or GC would judge the marker against an unrelated thread
+  // frontier and could drop a load-bearing marker). Only messages UNKNOWN to
+  // the timeline (older thread replies paged in by the thread panel) fall back
+  // to the open thread's root.
+  const msgParentFor = React.useCallback(
+    (
+      messageId: string,
+    ): { channelId: string; rootId: string | null } | undefined => {
+      if (!activeChannelId) return undefined;
+      const known = messageById.get(messageId);
+      if (known) {
+        return { channelId: activeChannelId, rootId: known.rootId ?? null };
+      }
+      return { channelId: activeChannelId, rootId: openThreadHeadId ?? null };
+    },
+    [activeChannelId, messageById, openThreadHeadId],
+  );
   const threadPanelIndex = React.useMemo(
     () => buildThreadPanelIndex(timelineMessages),
     [timelineMessages],
@@ -310,9 +339,19 @@ export function useChannelUnreadState({
     if (!openThreadHeadId) return;
     if (isThreadMuted(openThreadHeadId)) return;
     for (const entry of threadMessages) {
-      markMessageRead(entry.message.id, entry.message.createdAt);
+      markMessageRead(
+        entry.message.id,
+        entry.message.createdAt,
+        msgParentFor(entry.message.id),
+      );
     }
-  }, [openThreadHeadId, threadMessages, markMessageRead, isThreadMuted]);
+  }, [
+    openThreadHeadId,
+    threadMessages,
+    markMessageRead,
+    isThreadMuted,
+    msgParentFor,
+  ]);
   // Advance the aggregate `thread:<root>` frontier to the maximal safe
   // boundary: max reply createdAt when every reply is read, else
   // min(unread createdAt) - 1 so collapsed-unread branches stay unread
@@ -348,7 +387,7 @@ export function useChannelUnreadState({
     if (boundary === null) return;
     const effectiveThreadReadAt = getThreadReadAt(rootId, activeChannelId) ?? 0;
     if (boundary <= effectiveThreadReadAt) return;
-    markThreadRead(rootId, boundary);
+    markThreadRead(rootId, boundary, activeChannelId);
   }, [
     activeChannelId,
     currentPubkey,
@@ -519,7 +558,7 @@ export function useChannelUnreadState({
         const createdAt = createdAtByMessageId.get(replyId);
         if (createdAt !== undefined) {
           captureDividerReadState(replyId);
-          markMessageRead(replyId, createdAt);
+          markMessageRead(replyId, createdAt, msgParentFor(replyId));
         }
       }
     },
@@ -528,6 +567,7 @@ export function useChannelUnreadState({
       createdAtByMessageId,
       directReplyIdsByParentId,
       markMessageRead,
+      msgParentFor,
     ],
   );
 
@@ -541,7 +581,9 @@ export function useChannelUnreadState({
       for (const id of ids) {
         forcedUnreadMsgRef.current.delete(id);
         const createdAt = createdAtByMessageId.get(id);
-        if (createdAt !== undefined) markMessageRead(id, createdAt);
+        if (createdAt !== undefined) {
+          markMessageRead(id, createdAt, msgParentFor(id));
+        }
       }
       if (activeChannelId && forcedUnreadMsgRef.current.size === 0) {
         clearChannelUnreadSource(activeChannelId, "manual");
@@ -554,6 +596,7 @@ export function useChannelUnreadState({
       createdAtByMessageId,
       getReplyDescendantIdsForMessage,
       markMessageRead,
+      msgParentFor,
     ],
   );
 

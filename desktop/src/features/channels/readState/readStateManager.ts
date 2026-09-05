@@ -3,6 +3,7 @@ import type { RelayClient } from "@/shared/api/relayClientSession";
 import type { RelayEvent } from "@/shared/api/types";
 import { KIND_READ_STATE } from "@/shared/constants/kinds";
 import {
+  type ContextParent,
   READ_STATE_D_TAG_PREFIX,
   READ_STATE_FETCH_LIMIT,
   READ_STATE_HORIZON_SECONDS,
@@ -149,17 +150,32 @@ export function splitContextsIntoBudgetedSlots(args: {
   maxBytes: number;
   slotIdGenerator: () => string;
   sourceCreatedAt?: ReadonlyMap<string, number>;
+  contextParents?: ReadonlyMap<string, ContextParent>;
 }): SlotSplitResult | null {
   const {
     channelEntries,
-    threadMsgEntries,
     clientId,
     initialSlotCount,
     maxSlots,
     maxBytes,
     slotIdGenerator,
     sourceCreatedAt,
+    contextParents,
   } = args;
+
+  // Drop dominated thread/msg entries against the cross-slot union first:
+  // readers max-merge every slot, so a marker covered by any published channel
+  // key is inert regardless of which slot that key lands in. GC never touches
+  // channel keys, so the round-robin distribution below is unaffected.
+  let threadMsgEntries = args.threadMsgEntries;
+  if (contextParents) {
+    const union: Record<string, number> = {};
+    for (const [key, ts] of [...channelEntries, ...threadMsgEntries]) {
+      union[key] = ts;
+    }
+    dropDominatedContexts(union, contextParents);
+    threadMsgEntries = threadMsgEntries.filter(([key]) => key in union);
+  }
 
   const encoder = new TextEncoder();
   const blobFor = (c: Record<string, number>) =>
@@ -288,6 +304,121 @@ export function trimContextsToBudget(
   return { evicted: toEvict.length, fitsAfterTrim };
 }
 
+/**
+ * Drop `msg:`/`thread:` entries that are dominated by their parent frontier
+ * WITHIN THE SAME contexts record (NIP-RS "Dominated entries"): a `msg:` entry
+ * whose value is <= max(outgoing `thread:<root>`, outgoing channel marker), or
+ * a `thread:` entry whose value is <= the outgoing channel marker, reads
+ * identically on every conforming reader whether present or absent — dropping
+ * it frees byte budget for load-bearing markers with zero semantic change.
+ *
+ * Safety invariant: domination is judged ONLY against values present in the
+ * same outgoing record (a pre-drop snapshot of it), never against local
+ * effective state at large. A local-only channel value that other devices
+ * have never seen must not justify dropping a marker they depend on.
+ * Contexts with no recorded parent are never dropped — the parent map is
+ * best-effort (recorded at mark time; absent for legacy entries until the
+ * backfill resolves them) and an unmapped marker may be load-bearing.
+ *
+ * Snapshot soundness: entries are compared against pre-drop values, so a
+ * `msg:` entry judged by a `thread:` entry that is itself dropped stays
+ * sound — that thread entry was only dropped because the channel marker in
+ * the same record covers it, which then transitively covers the msg entry.
+ * Channel keys are never dropped.
+ *
+ * Mutates `contexts` in place; returns the number of entries dropped.
+ * Exported for unit testing; production callers go through
+ * collectPublishableContexts().
+ */
+export function dropDominatedContexts(
+  contexts: Record<string, number>,
+  parents: ReadonlyMap<string, ContextParent>,
+): number {
+  const snapshot = new Map(Object.entries(contexts));
+  let dropped = 0;
+  for (const [key, ts] of snapshot) {
+    const parent = parents.get(key);
+    if (!parent) continue;
+
+    let frontier: number | null = null;
+    if (key.startsWith(MSG_PREFIX)) {
+      const channelTerm = snapshot.get(parent.c);
+      const threadTerm =
+        parent.r === null
+          ? undefined
+          : snapshot.get(`${THREAD_PREFIX}${parent.r}`);
+      for (const term of [channelTerm, threadTerm]) {
+        if (term !== undefined && (frontier === null || term > frontier)) {
+          frontier = term;
+        }
+      }
+    } else if (key.startsWith(THREAD_PREFIX)) {
+      frontier = snapshot.get(parent.c) ?? null;
+    } else {
+      continue;
+    }
+
+    if (frontier !== null && ts <= frontier) {
+      delete contexts[key];
+      dropped++;
+    }
+  }
+  return dropped;
+}
+
+/**
+ * Result of a `collectPublishableContexts` call.
+ */
+export interface CollectResult {
+  /** The publish-ready contexts record, or null when channel keys alone
+   * exceed the byte budget (caller must fall back to multi-slot split). */
+  contexts: Record<string, number> | null;
+  /** Entries removed by the dominated-marker GC (semantically inert). */
+  dropped: number;
+  /** Entries evicted by the byte-budget trim (potentially load-bearing). */
+  evicted: number;
+}
+
+/**
+ * The single-slot publish pipeline: filter effective state to publishable
+ * contexts, drop dominated `msg:`/`thread:` entries (semantic no-op that
+ * relieves budget pressure), then trim to the byte budget as the reactive
+ * backstop. GC must run BEFORE the trim — the trim can evict load-bearing
+ * markers, so every byte a dominated entry occupies is a byte that can push a
+ * load-bearing marker out of the published blob.
+ *
+ * Exported for unit testing (this IS the production composition — a test
+ * binding it fails if the GC leaves the pipeline); callers should prefer
+ * `currentContexts()`.
+ */
+export function collectPublishableContexts(args: {
+  effectiveState: ReadonlyMap<string, number>;
+  publishableContextIds: ReadonlySet<string>;
+  contextParents: ReadonlyMap<string, ContextParent>;
+  clientId: string;
+  maxBytes: number;
+  sourceCreatedAt: ReadonlyMap<string, number>;
+}): CollectResult {
+  const contexts: Record<string, number> = {};
+  for (const [ctx, ts] of args.effectiveState) {
+    if (!args.publishableContextIds.has(ctx)) {
+      continue;
+    }
+    contexts[ctx] = ts;
+  }
+
+  const dropped = dropDominatedContexts(contexts, args.contextParents);
+
+  const { evicted, fitsAfterTrim } = trimContextsToBudget(
+    contexts,
+    args.clientId,
+    args.maxBytes,
+    args.sourceCreatedAt,
+  );
+
+  return { contexts: fitsAfterTrim ? contexts : null, dropped, evicted };
+}
+
 export class ReadStateManager {
   private pubkey: string;
   private relayClient: RelayClient;
@@ -304,6 +435,7 @@ export class ReadStateManager {
   private initialized = false;
   private maxFetchedCreatedAt = 0;
   private contextSourceCreatedAt = new Map<string, number>();
+  private contextParents = new Map<string, ContextParent>();
   private pendingSyncedAdvances = new Set<string>();
   private destroyed = false;
   private parentResolver: ContextParentResolver | null = null;
@@ -351,12 +483,35 @@ export class ReadStateManager {
     this.notifyListeners();
   }
 
-  markContextRead(contextId: string, unixTimestamp: number): void {
+  markContextRead(
+    contextId: string,
+    unixTimestamp: number,
+    parent?: ContextParent,
+  ): void {
+    if (parent) {
+      this.recordContextParent(contextId, parent);
+    }
     this.advanceContext(contextId, unixTimestamp, { publishable: true });
     this.contextSourceCreatedAt.set(
       contextId,
       Math.max(Math.floor(Date.now() / 1_000), this.maxFetchedCreatedAt + 1),
     );
+  }
+
+  /**
+   * Record the parent coordinates of a `msg:`/`thread:` context, captured at
+   * mark time where the event graph is available. Powers the dominated-marker
+   * GC on the publish path; contexts with no recorded parent are never GC'd.
+   * Idempotent — an unchanged parent does not schedule persistence.
+   */
+  recordContextParent(contextId: string, parent: ContextParent): void {
+    if (this.destroyed) return;
+    const existing = this.contextParents.get(contextId);
+    if (existing && existing.c === parent.c && existing.r === parent.r) {
+      return;
+    }
+    this.contextParents.set(contextId, { c: parent.c, r: parent.r });
+    this.persistLocalState();
   }
 
   seedContextRead(contextId: string, unixTimestamp: number): void {
@@ -860,36 +1015,30 @@ export class ReadStateManager {
   }
 
   private currentContexts(): Record<string, number> | null {
-    const contexts: Record<string, number> = {};
-    for (const [ctx, ts] of this.effectiveState) {
-      if (!this.publishableContextIds.has(ctx)) {
-        continue;
-      }
-      contexts[ctx] = ts;
+    const { contexts, dropped, evicted } = collectPublishableContexts({
+      effectiveState: this.effectiveState,
+      publishableContextIds: this.publishableContextIds,
+      contextParents: this.contextParents,
+      clientId: this.clientId,
+      maxBytes: READ_STATE_MAX_PLAINTEXT_BYTES,
+      sourceCreatedAt: this.contextSourceCreatedAt,
+    });
+    if (dropped > 0) {
+      console.debug(
+        `[ReadStateManager] currentContexts dropped ${dropped} dominated entries`,
+      );
     }
-
-    // Byte-budget trim (reactive backstop).
-    // Evict least-recently-affirmed msg: then thread: entries until the blob
-    // fits 32 KB. Channel keys are never evicted here.
-    const { evicted, fitsAfterTrim } = trimContextsToBudget(
-      contexts,
-      this.clientId,
-      READ_STATE_MAX_PLAINTEXT_BYTES,
-      this.contextSourceCreatedAt,
-    );
     if (evicted > 0) {
       console.warn(
         `[ReadStateManager] currentContexts trimmed ${evicted} entries to fit byte budget`,
       );
     }
-    if (!fitsAfterTrim) {
+    if (contexts === null) {
       // Channel keys alone exceed budget — caller must use multi-slot split.
       console.warn(
         "[ReadStateManager] currentContexts: channel keys exceed byte budget — will split across slots",
       );
-      return null;
     }
-
     return contexts;
   }
 
@@ -929,6 +1078,7 @@ export class ReadStateManager {
       maxBytes: READ_STATE_MAX_PLAINTEXT_BYTES,
       slotIdGenerator: () => generateHex(16),
       sourceCreatedAt: this.contextSourceCreatedAt,
+      contextParents: this.contextParents,
     });
 
     if (result === null) {
@@ -966,6 +1116,9 @@ export class ReadStateManager {
     for (const [contextId, createdAt] of stored.contextSourceCreatedAt) {
       this.contextSourceCreatedAt.set(contextId, createdAt);
     }
+    for (const [contextId, parent] of stored.contextParents) {
+      this.contextParents.set(contextId, parent);
+    }
     this.writeLocalState();
   }
 
@@ -998,6 +1151,7 @@ export class ReadStateManager {
       this.effectiveState,
       this.publishableContextIds,
       this.contextSourceCreatedAt,
+      this.contextParents,
     );
   }
 

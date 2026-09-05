@@ -363,10 +363,15 @@ export function ChannelActivityPopover({
   const handleMarkRead = React.useCallback(
     (item: InboxItem) => {
       clearUnreadOverride(item);
+      const channelId = item.item.channelId ?? null;
       for (const reply of item.groupItems) {
-        markMessageRead(reply.id, reply.createdAt);
+        markMessageRead(
+          reply.id,
+          reply.createdAt,
+          channelId ? { channelId, rootId: item.conversationId } : undefined,
+        );
       }
-      markThreadRead(item.conversationId, item.latestActivityAt);
+      markThreadRead(item.conversationId, item.latestActivityAt, channelId);
     },
     [clearUnreadOverride, markMessageRead, markThreadRead],
   );

@@ -40,9 +40,17 @@ type UseHomeInboxReadStateOptions = {
     source: ForcedUnreadSource,
   ) => void;
   /** Advance the thread read marker to the given unix-seconds timestamp. */
-  markThreadRead: (rootId: string, timestamp: number) => void;
+  markThreadRead: (
+    rootId: string,
+    timestamp: number,
+    channelId?: string | null,
+  ) => void;
   /** Advance a reply's per-message read marker to the given unix-seconds timestamp. */
-  markMessageRead: (messageId: string, timestamp: number) => void;
+  markMessageRead: (
+    messageId: string,
+    timestamp: number,
+    parent?: { channelId: string; rootId: string | null },
+  ) => void;
   /** Local fallback: mark a non-channel item done. */
   markDoneLocal: (id: string) => void;
   /** Local inbox row override: mark an item unread alongside its channel emphasis. */
@@ -242,9 +250,13 @@ export function useHomeInboxReadState({
             continue;
           }
           markedReplyIds.add(reply.id);
-          markMessageRead(reply.id, reply.createdAt);
+          markMessageRead(
+            reply.id,
+            reply.createdAt,
+            channelId ? { channelId, rootId: threadRootId } : undefined,
+          );
         }
-        markThreadRead(threadRootId, item.latestActivityAt);
+        markThreadRead(threadRootId, item.latestActivityAt, channelId);
         const groupedChannelRead = getGroupedChannelReadTimestamp(item);
         if (groupedChannelRead) {
           markChannelRead(

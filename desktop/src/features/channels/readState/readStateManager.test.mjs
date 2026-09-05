@@ -4,10 +4,13 @@ import test from "node:test";
 import {
   ReadStateManager,
   applyRemoteContextTimestamp,
+  collectPublishableContexts,
+  dropDominatedContexts,
   resolveEffectiveTimestamp,
   splitContextsIntoBudgetedSlots,
   trimContextsToBudget,
 } from "./readStateManager.ts";
+import { READ_STATE_MAX_PLAINTEXT_BYTES } from "./readStateFormat.ts";
 
 // ── ReadStateManager integration helpers ─────────────────────────────────────
 // Provide browser globals required by ReadStateManager (localStorage,
@@ -153,8 +156,8 @@ test("advanceContext burst coalesces local persistence into one write", () => {
     timers.runAll();
     assert.equal(
       storage.writes.length - baselineWrites,
-      3,
-      "one writeStoredReadState call writes its three blobs once",
+      4,
+      "one writeStoredReadState call writes its four blobs once",
     );
   } finally {
     manager.destroy();
@@ -179,7 +182,7 @@ test("sustained advances persist within each one-second window", () => {
       if (timestamp % 1_000 === 0) {
         assert.equal(
           storage.writes.length - baselineWrites,
-          (timestamp / 1_000) * 3,
+          (timestamp / 1_000) * 4,
           "latest state should persist once per one-second window",
         );
       }
@@ -211,7 +214,7 @@ test("visibility hidden flushes pending local state", () => {
     globalThis.document.dispatchEvent(new Event("visibilitychange"));
 
     assert.equal(timers.size, 0, "flush should cancel the trailing timer");
-    assert.equal(storage.writes.length - baselineWrites, 3);
+    assert.equal(storage.writes.length - baselineWrites, 4);
     const contexts = JSON.parse(
       storage.getItem(`buzz.channel-read-state.v2:${"2".repeat(64)}`),
     );
@@ -239,7 +242,7 @@ test("hydrateFromLocalStorage persists immediately", () => {
     manager.hydrateFromLocalStorage();
 
     assert.equal(timers.size, 0);
-    assert.equal(storage.writes.length - baselineWrites, 3);
+    assert.equal(storage.writes.length - baselineWrites, 4);
     assert.equal(manager.getOwnTimestamp("channel-1"), 100);
   } finally {
     manager.destroy();
@@ -261,7 +264,7 @@ test("publish flushes pending local state first", async () => {
     await manager.publish();
 
     assert.equal(timers.size, 0);
-    assert.equal(storage.writes.length - baselineWrites, 3);
+    assert.equal(storage.writes.length - baselineWrites, 4);
   } finally {
     manager.destroy();
     restore();
@@ -1086,4 +1089,239 @@ test("rememberPublishedId_evictsOldestBeyondCap", () => {
   assert.ok(ids.has(`id-${total - 1}`), "newest id must be retained");
 
   mgr.destroy();
+});
+
+// ── Dominated-marker GC (NIP-RS "Dominated entries") ─────────────────────────
+
+const GC_CHANNEL = "channel-1";
+const GC_CHANNEL_B = "channel-2";
+
+function hex64(seed) {
+  return String(seed).padStart(8, "0").repeat(8);
+}
+
+test("dropDominatedContexts drops a msg entry covered by its channel marker", () => {
+  const msgKey = `msg:${MSG_ID}`;
+  const contexts = { [GC_CHANNEL]: 100, [msgKey]: 90 };
+  const dropped = dropDominatedContexts(
+    contexts,
+    new Map([[msgKey, { c: GC_CHANNEL, r: null }]]),
+  );
+  assert.equal(dropped, 1);
+  assert.ok(!(msgKey in contexts));
+  assert.equal(contexts[GC_CHANNEL], 100, "channel keys are never dropped");
+});
+
+test("dropDominatedContexts drops a msg entry covered by its thread frontier alone", () => {
+  const msgKey = `msg:${MSG_ID}`;
+  const threadKey = `thread:${THREAD_ID}`;
+  const contexts = { [GC_CHANNEL]: 50, [threadKey]: 120, [msgKey]: 100 };
+  const dropped = dropDominatedContexts(
+    contexts,
+    new Map([[msgKey, { c: GC_CHANNEL, r: THREAD_ID }]]),
+  );
+  assert.equal(dropped, 1);
+  assert.ok(!(msgKey in contexts));
+  assert.equal(contexts[threadKey], 120);
+});
+
+test("dropDominatedContexts keeps a msg entry above both parent frontiers", () => {
+  const msgKey = `msg:${MSG_ID}`;
+  const threadKey = `thread:${THREAD_ID}`;
+  const contexts = { [GC_CHANNEL]: 100, [threadKey]: 120, [msgKey]: 150 };
+  const dropped = dropDominatedContexts(
+    contexts,
+    new Map([[msgKey, { c: GC_CHANNEL, r: THREAD_ID }]]),
+  );
+  assert.equal(dropped, 0);
+  assert.equal(contexts[msgKey], 150);
+});
+
+test("dropDominatedContexts never drops an unmapped entry", () => {
+  const msgKey = `msg:${MSG_ID}`;
+  const contexts = { [GC_CHANNEL]: 100, [msgKey]: 90 };
+  const dropped = dropDominatedContexts(contexts, new Map());
+  assert.equal(dropped, 0);
+  assert.equal(
+    contexts[msgKey],
+    90,
+    "an unmapped marker may be load-bearing — GC must not touch it",
+  );
+});
+
+test("dropDominatedContexts judges only against the outgoing record, never wider state", () => {
+  // The parent channel key is NOT part of the outgoing record (e.g. it is a
+  // local-only seeded value other devices have never seen). Dropping the msg
+  // marker on the strength of it would resurrect the event as unread on every
+  // other device — the marker must survive.
+  const msgKey = `msg:${MSG_ID}`;
+  const contexts = { [msgKey]: 90 };
+  const dropped = dropDominatedContexts(
+    contexts,
+    new Map([[msgKey, { c: GC_CHANNEL, r: null }]]),
+  );
+  assert.equal(dropped, 0);
+  assert.equal(contexts[msgKey], 90);
+});
+
+test("dropDominatedContexts thread tie is dominated; transitive msg coverage stays sound", () => {
+  // thread == channel (tie → dominated, ties read as covered everywhere) and
+  // msg ≤ thread. Both drop; the surviving channel key transitively covers the
+  // msg entry, so judging against the pre-drop snapshot is sound.
+  const msgKey = `msg:${MSG_ID}`;
+  const threadKey = `thread:${THREAD_ID}`;
+  const contexts = { [GC_CHANNEL]: 100, [threadKey]: 100, [msgKey]: 95 };
+  const dropped = dropDominatedContexts(
+    contexts,
+    new Map([
+      [msgKey, { c: GC_CHANNEL, r: THREAD_ID }],
+      [threadKey, { c: GC_CHANNEL, r: null }],
+    ]),
+  );
+  assert.equal(dropped, 2);
+  assert.deepEqual(contexts, { [GC_CHANNEL]: 100 });
+});
+
+// ── Publish pipeline: GC relieves budget pressure before the trim ────────────
+//
+// The occurrence-#4 mechanism: dominated msg entries overflow the byte budget
+// and the recency-keyed trim evicts a LOAD-BEARING marker (sole cover for an
+// event newer than its channel frontier, oldest read-action recency). With the
+// GC in the pipeline the dominated bulk is dropped first and the load-bearing
+// marker survives in the published blob.
+
+function occurrence4State() {
+  const loadBearingKey = `msg:${"f".repeat(64)}`;
+  const effectiveState = new Map([[GC_CHANNEL, 1_000_000]]);
+  const sourceCreatedAt = new Map([[loadBearingKey, 1]]); // oldest recency
+  const contextParents = new Map([
+    [loadBearingKey, { c: GC_CHANNEL, r: null }],
+  ]);
+  effectiveState.set(loadBearingKey, 2_000_000); // newer than the channel marker
+
+  for (let i = 0; i < 600; i++) {
+    const key = `msg:${hex64(i)}`;
+    effectiveState.set(key, 999_000); // ≤ channel marker → dominated
+    sourceCreatedAt.set(key, 1_000 + i); // newer recency than load-bearing
+    contextParents.set(key, { c: GC_CHANNEL, r: null });
+  }
+  return {
+    effectiveState,
+    publishableContextIds: new Set(effectiveState.keys()),
+    sourceCreatedAt,
+    contextParents,
+    loadBearingKey,
+  };
+}
+
+test("collectPublishableContexts_gcSavesLoadBearingMarkerFromEviction", () => {
+  const state = occurrence4State();
+  const result = collectPublishableContexts({
+    effectiveState: state.effectiveState,
+    publishableContextIds: state.publishableContextIds,
+    contextParents: state.contextParents,
+    clientId: CLIENT_ID,
+    maxBytes: READ_STATE_MAX_PLAINTEXT_BYTES,
+    sourceCreatedAt: state.sourceCreatedAt,
+  });
+
+  assert.notEqual(result.contexts, null);
+  assert.equal(result.dropped, 600, "every dominated entry is dropped");
+  assert.equal(result.evicted, 0, "GC freed enough budget — no trim eviction");
+  assert.equal(
+    result.contexts[state.loadBearingKey],
+    2_000_000,
+    "the load-bearing marker survives in the published blob",
+  );
+  assert.equal(result.contexts[GC_CHANNEL], 1_000_000);
+});
+
+test("collectPublishableContexts_withoutParentsTheTrimEvictsTheLoadBearingMarker", () => {
+  // Falsifiability control — the exact pre-GC pipeline (empty parent map) on
+  // the same state reproduces the bug: the trim evicts by recency and the
+  // load-bearing marker (oldest recency) is the first to go.
+  const state = occurrence4State();
+  const result = collectPublishableContexts({
+    effectiveState: state.effectiveState,
+    publishableContextIds: state.publishableContextIds,
+    contextParents: new Map(),
+    clientId: CLIENT_ID,
+    maxBytes: READ_STATE_MAX_PLAINTEXT_BYTES,
+    sourceCreatedAt: state.sourceCreatedAt,
+  });
+
+  assert.notEqual(result.contexts, null);
+  assert.equal(result.dropped, 0);
+  assert.ok(
+    result.evicted > 0,
+    "the fixture must genuinely overflow the budget",
+  );
+  assert.ok(
+    !(state.loadBearingKey in result.contexts),
+    "without GC the oldest-recency load-bearing marker is evicted — the bug",
+  );
+});
+
+test("splitContextsIntoBudgetedSlots_gcsDominatedEntriesAgainstCrossSlotUnion", () => {
+  // The dominating channel key lands in slot 1 while thread/msg entries live
+  // in slot 0 — readers max-merge all slots, so union-level domination is
+  // sound and the dominated entry must not survive in slot 0.
+  const dominatedKey = `msg:${MSG_ID}`;
+  const keptKey = `msg:${"e".repeat(64)}`;
+  const result = splitContextsIntoBudgetedSlots({
+    channelEntries: [
+      [GC_CHANNEL, 100],
+      [GC_CHANNEL_B, 200],
+    ],
+    threadMsgEntries: [
+      [dominatedKey, 150], // ≤ GC_CHANNEL_B's 200
+      [keptKey, 300],
+    ],
+    clientId: CLIENT_ID,
+    initialSlotCount: 2,
+    maxSlots: 8,
+    maxBytes: READ_STATE_MAX_PLAINTEXT_BYTES,
+    slotIdGenerator: () => "unused",
+    contextParents: new Map([
+      [dominatedKey, { c: GC_CHANNEL_B, r: null }],
+      [keptKey, { c: GC_CHANNEL_B, r: null }],
+    ]),
+  });
+
+  assert.notEqual(result, null);
+  assert.ok(!(dominatedKey in result.slots[0]));
+  assert.equal(result.slots[0][keptKey], 300);
+});
+
+test("markContextRead_withParent_persistsAndSurvivesRestart", async () => {
+  const storage = makeLocalStorage();
+  globalThis.window.localStorage = storage;
+  const { timers, restore } = withFakeTimers();
+  const pubkey = "7".repeat(64);
+  const msgKey = `msg:${MSG_ID}`;
+  const manager = new ReadStateManager(pubkey, makeFakeRelay());
+
+  try {
+    manager.markContextRead(msgKey, 100, { c: GC_CHANNEL, r: THREAD_ID });
+    timers.advanceBy(1_000);
+
+    const persisted = JSON.parse(
+      storage.getItem(`buzz.channel-read-state.parents.v1:${pubkey}`),
+    );
+    assert.deepEqual(persisted[msgKey], { c: GC_CHANNEL, r: THREAD_ID });
+
+    manager.destroy();
+    // Hydration happens in initialize(), not the constructor.
+    const rehydrated = new ReadStateManager(pubkey, makeFakeRelay());
+    await rehydrated.initialize();
+    assert.deepEqual(
+      rehydrated.contextParents.get(msgKey),
+      { c: GC_CHANNEL, r: THREAD_ID },
+      "parents hydrate from storage on restart",
+    );
+    rehydrated.destroy();
+  } finally {
+    manager.destroy();
+    restore();
+  }
 });

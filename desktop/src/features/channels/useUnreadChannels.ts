@@ -15,6 +15,7 @@ import {
   type ObservedUnreadEvent,
 } from "@/features/channels/unreadChannelCounts";
 import { useReadState } from "@/features/channels/readState/useReadState";
+import type { ContextParent } from "@/features/channels/readState/readStateFormat";
 import {
   forcedUnreadStore,
   type ForcedUnreadMap,
@@ -346,9 +347,13 @@ export function useUnreadChannels(
       {
         preserveForcedUnread = false,
         topLevelOnly = false,
+        parent,
       }: {
         preserveForcedUnread?: boolean;
         topLevelOnly?: boolean;
+        /** Parent coordinates for thread:/msg: context keys — recorded on the
+         * manager to power dominated-marker GC on the publish path. */
+        parent?: ContextParent;
       } = {},
     ) => {
       if (
@@ -369,7 +374,7 @@ export function useUnreadChannels(
         observedLatest,
       );
       if (markAt === null) return;
-      markContextRead(channelId, markAt);
+      markContextRead(channelId, markAt, parent);
       observedPersistence.syncMarkers(
         [channelId],
         new Map([[channelId, markAt]]),

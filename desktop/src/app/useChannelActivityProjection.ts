@@ -2,6 +2,7 @@ import * as React from "react";
 
 import { useThreadActivityFeedItems } from "@/app/useThreadActivityFeedItems";
 import {
+  type ContextParent,
   maxReadAt,
   msgContextKey,
 } from "@/features/channels/readState/readStateFormat";
@@ -16,7 +17,7 @@ type ReadTimestamp = (contextKey: string) => number | null;
 type MarkChannelRead = (
   contextKey: string,
   readAt: string | null | undefined,
-  options?: { topLevelOnly?: boolean },
+  options?: { topLevelOnly?: boolean; parent?: ContextParent },
 ) => void;
 
 type UseChannelActivityProjectionOptions = {
@@ -70,10 +71,11 @@ export function useChannelActivityProjection({
     [getChannelReadAt, getOwnReadAt],
   );
   const markThreadRead = React.useCallback(
-    (rootId: string, timestamp: number) =>
+    (rootId: string, timestamp: number, channelId?: string | null) =>
       markChannelRead(
         `thread:${rootId}`,
         new Date(timestamp * 1_000).toISOString(),
+        channelId ? { parent: { c: channelId, r: null } } : undefined,
       ),
     [markChannelRead],
   );
@@ -87,10 +89,17 @@ export function useChannelActivityProjection({
     [getOwnReadAt],
   );
   const markMessageRead = React.useCallback(
-    (messageId: string, timestamp: number) =>
+    (
+      messageId: string,
+      timestamp: number,
+      parent?: { channelId: string; rootId: string | null },
+    ) =>
       markChannelRead(
         msgContextKey(messageId),
         new Date(timestamp * 1_000).toISOString(),
+        parent
+          ? { parent: { c: parent.channelId, r: parent.rootId } }
+          : undefined,
       ),
     [markChannelRead],
   );

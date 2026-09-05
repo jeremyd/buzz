@@ -3,6 +3,7 @@ import {
   ReadStateManager,
   type ContextParentResolver,
 } from "@/features/channels/readState/readStateManager";
+import type { ContextParent } from "@/features/channels/readState/readStateFormat";
 import type { RelayClient } from "@/shared/api/relayClientSession";
 
 const noopGetTimestamp = () => null;
@@ -69,8 +70,12 @@ export function useReadState(
   );
 
   const markContextRead = React.useCallback(
-    (contextId: string, unixTimestamp: number): void => {
-      managerRef.current?.markContextRead(contextId, unixTimestamp);
+    (
+      contextId: string,
+      unixTimestamp: number,
+      parent?: ContextParent,
+    ): void => {
+      managerRef.current?.markContextRead(contextId, unixTimestamp, parent);
     },
     [],
   );

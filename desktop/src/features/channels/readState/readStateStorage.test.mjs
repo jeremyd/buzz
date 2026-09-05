@@ -219,3 +219,62 @@ test("writeStoredReadState survives a throwing localStorage.setItem", () => {
     );
   });
 });
+
+test("writeStoredReadState persists parents only for surviving contexts and round-trips", () => {
+  installLocalStorage();
+  const pubkey = "9".repeat(64);
+  const nowSeconds = Math.floor(Date.now() / 1_000);
+  const staleSeconds = nowSeconds - READ_STATE_HORIZON_SECONDS - 10;
+  const keptKey = `msg:${"a".repeat(64)}`;
+  const prunedKey = `msg:${"b".repeat(64)}`;
+
+  writeStoredReadState(
+    pubkey,
+    new Map([
+      ["channel-1", nowSeconds],
+      [keptKey, nowSeconds],
+      [prunedKey, staleSeconds], // beyond horizon → pruned
+    ]),
+    new Set([keptKey]),
+    new Map([
+      [keptKey, nowSeconds],
+      [prunedKey, staleSeconds],
+    ]),
+    new Map([
+      [keptKey, { c: "channel-1", r: "c".repeat(64) }],
+      [prunedKey, { c: "channel-1", r: null }],
+    ]),
+  );
+
+  const stored = readStoredReadState(pubkey);
+  assert.deepEqual(stored.contextParents.get(keptKey), {
+    c: "channel-1",
+    r: "c".repeat(64),
+  });
+  assert.equal(
+    stored.contextParents.has(prunedKey),
+    false,
+    "a pruned context's parent record is dropped with it",
+  );
+});
+
+test("readStoredReadState tolerates corrupt or malformed parent records", () => {
+  const ls = installLocalStorage();
+  const pubkey = "8".repeat(64);
+  ls.setItem(
+    `buzz.channel-read-state.parents.v1:${pubkey}`,
+    JSON.stringify({
+      [`msg:${"a".repeat(64)}`]: { c: "channel-1", r: null },
+      [`msg:${"b".repeat(64)}`]: { c: 42, r: null }, // malformed c
+      [`msg:${"c".repeat(64)}`]: { c: "channel-1" }, // missing r
+      [`msg:${"d".repeat(64)}`]: "junk",
+    }),
+  );
+
+  const stored = readStoredReadState(pubkey);
+  assert.deepEqual(
+    [...stored.contextParents.keys()],
+    [`msg:${"a".repeat(64)}`],
+    "only the well-formed record survives",
+  );
+});
