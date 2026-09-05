@@ -556,6 +556,21 @@ export class ReadStateManager {
   }
 
   /**
+   * Snapshot of own contexts whose id starts with `prefix` (e.g. `msg:`),
+   * as [contextId, markerTimestamp] pairs. Read-only enumeration for the
+   * thread-marker backfill; mutations go through markContextRead.
+   */
+  listOwnContexts(prefix: string): Array<[string, number]> {
+    const entries: Array<[string, number]> = [];
+    for (const [contextId, timestamp] of this.effectiveState) {
+      if (contextId.startsWith(prefix)) {
+        entries.push([contextId, timestamp]);
+      }
+    }
+    return entries;
+  }
+
+  /**
    * The context's OWN merged read marker, WITHOUT the hierarchical parent term.
    * Callers that evaluate a `thread:<root>` context outside the active channel
    * (e.g. the sidebar unread scan over background channels) must use this:

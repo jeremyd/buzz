@@ -10,6 +10,8 @@ const noopGetTimestamp = () => null;
 const noopMarkRead = () => {};
 const noopDrainAdvances = (): ReadonlySet<string> => new Set<string>();
 const noopSetResolver = () => {};
+const noopListContexts = (): Array<[string, number]> => [];
+const noopRecordParent = () => {};
 
 /**
  * React hook that creates and manages a ReadStateManager instance.
@@ -91,6 +93,20 @@ export function useReadState(
     return managerRef.current?.drainSyncedAdvances() ?? new Set<string>();
   }, []);
 
+  const listOwnContexts = React.useCallback(
+    (prefix: string): Array<[string, number]> => {
+      return managerRef.current?.listOwnContexts(prefix) ?? [];
+    },
+    [],
+  );
+
+  const recordContextParent = React.useCallback(
+    (contextId: string, parent: ContextParent): void => {
+      managerRef.current?.recordContextParent(contextId, parent);
+    },
+    [],
+  );
+
   const setContextParentResolver = React.useCallback(
     (resolver: ContextParentResolver | null): void => {
       managerRef.current?.setContextParentResolver(resolver);
@@ -112,6 +128,8 @@ export function useReadState(
       setContextParentResolver: noopSetResolver,
       readStateVersion: 0,
       getOwnTimestamp: noopGetTimestamp,
+      listOwnContexts: noopListContexts,
+      recordContextParent: noopRecordParent,
     };
   }
 
@@ -124,5 +142,7 @@ export function useReadState(
     setContextParentResolver,
     readStateVersion,
     getOwnTimestamp,
+    listOwnContexts,
+    recordContextParent,
   };
 }

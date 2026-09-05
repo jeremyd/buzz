@@ -15,6 +15,7 @@ import {
   type ObservedUnreadEvent,
 } from "@/features/channels/unreadChannelCounts";
 import { useReadState } from "@/features/channels/readState/useReadState";
+import { useThreadMarkerBackfill } from "@/features/channels/readState/useThreadMarkerBackfill";
 import type { ContextParent } from "@/features/channels/readState/readStateFormat";
 import {
   forcedUnreadStore,
@@ -158,7 +159,22 @@ export function useUnreadChannels(
     setContextParentResolver,
     readStateVersion,
     getOwnTimestamp,
+    listOwnContexts,
+    recordContextParent,
   } = useReadState(pubkey, relayClient);
+
+  // Aggregate legacy msg: markers into durable thread: markers for the active
+  // community (bounded background drain; see threadMarkerBackfill.ts).
+  useThreadMarkerBackfill({
+    enabled: isReadStateReady,
+    pubkey,
+    relayUrl: normalizedRelayUrl,
+    relayClient,
+    listOwnContexts,
+    getOwnTimestamp,
+    markContextRead,
+    recordContextParent,
+  });
 
   // Per-channel latest observed external trigger timestamp (unix seconds) and
   // per-event metadata. Derived relay evidence, not source-of-truth; the unread
