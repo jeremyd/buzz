@@ -107,40 +107,82 @@ void main() {
     },
   );
 
-  test('disables remote sync after an oversized local blob', () async {
-    SharedPreferences.setMockInitialValues({});
-    final prefs = await SharedPreferences.getInstance();
-    final keychain = nostr.Keys.generate();
-    final crypto = ReadStateCrypto.tryCreate(
-      nsec: keychain.nsec,
-      pubkey: keychain.public,
-    )!;
-    final relay = _FakeSignedEventRelay();
-    final manager = ReadStateManager(
-      pubkey: keychain.public,
-      prefs: prefs,
-      crypto: crypto,
-      relaySession: null,
-      signedEventRelay: relay,
-      remoteEnabled: true,
-      onChanged: () {},
-    );
-
-    for (var index = 0; index < 1400; index++) {
-      manager.markContextRead(
-        'channel-${index.toString().padLeft(4, '0')}-${'x' * 48}',
-        index + 1,
+  test(
+    'skips publish while channel keys alone exceed the budget — never terminal',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final keychain = nostr.Keys.generate();
+      final crypto = ReadStateCrypto.tryCreate(
+        nsec: keychain.nsec,
+        pubkey: keychain.public,
+      )!;
+      final relay = _FakeSignedEventRelay();
+      final manager = ReadStateManager(
+        pubkey: keychain.public,
+        prefs: prefs,
+        crypto: crypto,
+        relaySession: null,
+        signedEventRelay: relay,
+        remoteEnabled: true,
+        onChanged: () {},
       );
-    }
-    await manager.flush();
 
-    manager.markContextRead('channel-new', 2000);
-    await manager.flush();
+      // Channel keys are never trimmed, so this state cannot fit the budget.
+      for (var index = 0; index < 1400; index++) {
+        manager.markContextRead(
+          'channel-${index.toString().padLeft(4, '0')}-${'x' * 48}',
+          index + 1,
+        );
+      }
+      await manager.flush();
 
-    expect(relay.submitCount, 0);
-    expect(manager.getEffectiveTimestamp('channel-0000-${'x' * 48}'), 1);
-    expect(manager.getEffectiveTimestamp('channel-new'), 2000);
-  });
+      manager.markContextRead('channel-new', 2000);
+      await manager.flush();
+
+      expect(relay.submitCount, 0);
+      expect(manager.getEffectiveTimestamp('channel-0000-${'x' * 48}'), 1);
+      expect(manager.getEffectiveTimestamp('channel-new'), 2000);
+    },
+  );
+
+  test(
+    'publishes an msg-heavy state after GC and trim instead of disabling sync',
+    () async {
+      SharedPreferences.setMockInitialValues({});
+      final prefs = await SharedPreferences.getInstance();
+      final keychain = nostr.Keys.generate();
+      final crypto = ReadStateCrypto.tryCreate(
+        nsec: keychain.nsec,
+        pubkey: keychain.public,
+      )!;
+      final relay = _FakeSignedEventRelay();
+      final manager = ReadStateManager(
+        pubkey: keychain.public,
+        prefs: prefs,
+        crypto: crypto,
+        relaySession: null,
+        signedEventRelay: relay,
+        remoteEnabled: true,
+        onChanged: () {},
+      );
+
+      // Well over the byte budget in msg: markers, every one dominated by the
+      // channel frontier. Before the publish-path GC this state tripped the
+      // NIP-44 oversize error and permanently disabled remote sync.
+      manager.markContextRead('channel-1', 1_000_000);
+      for (var index = 0; index < 1400; index++) {
+        manager.markContextRead(
+          msgContextKey(index.toRadixString(16).padLeft(64, '0')),
+          999_000,
+          parent: const ContextParent(c: 'channel-1', r: null),
+        );
+      }
+      await manager.flush();
+
+      expect(relay.submitCount, 1, reason: 'GC shrinks the blob to fit');
+    },
+  );
 
   test('remote read-state rollback is ignored', () async {
     SharedPreferences.setMockInitialValues({});

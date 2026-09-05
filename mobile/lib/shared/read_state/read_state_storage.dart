@@ -20,6 +20,9 @@ String localPublishableContextKey(String pubkey) =>
 String localSourceCreatedAtKey(String pubkey) =>
     'buzz.channel-read-state.source-created-at.v1:$pubkey';
 
+String localContextParentsKey(String pubkey) =>
+    'buzz.channel-read-state.parents.v1:$pubkey';
+
 String clientIdKey(String pubkey) => '$_clientIdKeyPrefix:$pubkey';
 
 String slotIdKey(String pubkey) => '$_slotIdKeyPrefix:$pubkey';
@@ -28,14 +31,17 @@ class StoredReadState {
   final Map<String, int> contexts;
   final Set<String> publishableContextIds;
   final Map<String, int> sourceCreatedAt;
+  final Map<String, ContextParent> contextParents;
 
   StoredReadState({
     required Map<String, int> contexts,
     required Set<String> publishableContextIds,
     required Map<String, int> sourceCreatedAt,
+    Map<String, ContextParent> contextParents = const {},
   }) : contexts = Map.unmodifiable(contexts),
        publishableContextIds = Set.unmodifiable(publishableContextIds),
-       sourceCreatedAt = Map.unmodifiable(sourceCreatedAt);
+       sourceCreatedAt = Map.unmodifiable(sourceCreatedAt),
+       contextParents = Map.unmodifiable(contextParents);
 }
 
 class ReadStateStorage {
@@ -76,6 +82,7 @@ class ReadStateStorage {
       contexts: _readContexts(pubkey),
       publishableContextIds: _readPublishableContextIds(pubkey),
       sourceCreatedAt: _readSourceCreatedAt(pubkey),
+      contextParents: _readContextParents(pubkey),
     );
   }
 
@@ -83,8 +90,9 @@ class ReadStateStorage {
     String pubkey,
     Map<String, int> contexts,
     Set<String> publishableContextIds,
-    Map<String, int> sourceCreatedAt,
-  ) {
+    Map<String, int> sourceCreatedAt, [
+    Map<String, ContextParent> contextParents = const {},
+  ]) {
     final state = <String, String>{};
     for (final entry in contexts.entries) {
       state[entry.key] = unixSecondsToDateTime(entry.value).toIso8601String();
@@ -99,6 +107,15 @@ class ReadStateStorage {
       localSourceCreatedAtKey(pubkey),
       jsonEncode(sourceCreatedAt.map((k, v) => MapEntry(k, v.toString()))),
     );
+
+    // Parents ride the contexts map: entries whose context no longer exists
+    // are dropped, so the table stays bounded by the contexts map itself.
+    final parentState = <String, Map<String, String?>>{
+      for (final entry in contextParents.entries)
+        if (contexts.containsKey(entry.key))
+          entry.key: {'c': entry.value.c, 'r': entry.value.r},
+    };
+    _prefs.setString(localContextParentsKey(pubkey), jsonEncode(parentState));
   }
 
   Map<String, int> _readContexts(String pubkey) {
@@ -157,6 +174,34 @@ class ReadStateStorage {
       for (final value in parsed)
         if (value is String) value,
     };
+  }
+
+  Map<String, ContextParent> _readContextParents(String pubkey) {
+    final raw = _prefs.getString(localContextParentsKey(pubkey));
+    if (raw == null || raw.isEmpty) return {};
+
+    final Object? parsed;
+    try {
+      parsed = jsonDecode(raw);
+    } catch (e) {
+      debugPrint('[ReadStateManager] storage: contextParents JSON corrupt: $e');
+      return {};
+    }
+
+    final record = asStringObjectMap(parsed);
+    if (record == null) return {};
+
+    final result = <String, ContextParent>{};
+    for (final entry in record.entries) {
+      final value = entry.value;
+      if (value is! Map) continue;
+      final c = value['c'];
+      final r = value['r'];
+      if (c is! String || c.isEmpty) continue;
+      if (r != null && r is! String) continue;
+      result[entry.key] = ContextParent(c: c, r: r as String?);
+    }
+    return result;
   }
 
   Map<String, int> _readSourceCreatedAt(String pubkey) {

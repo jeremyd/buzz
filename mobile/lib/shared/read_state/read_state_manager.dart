@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../crypto/nip44.dart';
 import '../relay/relay.dart';
 import 'read_state_format.dart';
+import 'read_state_gc.dart';
 import 'read_state_storage.dart';
 import 'read_state_time.dart';
 
@@ -66,6 +67,7 @@ class ReadStateManager {
   bool _remoteUnsupported = false;
   int _maxFetchedCreatedAt = 0;
   final Map<String, int> _contextSourceCreatedAt = {};
+  final Map<String, ContextParent> _contextParents = {};
   final Set<String> _pendingSyncedAdvances = {};
 
   ReadStateManager({
@@ -105,7 +107,7 @@ class ReadStateManager {
 
     await _fetchAndMerge();
     await _startLiveSubscription();
-    if (!_isIdenticalToLastPublished(_currentContexts())) {
+    if (_hasUnpublishedChanges()) {
       _schedulePublish();
     }
 
@@ -115,12 +117,30 @@ class ReadStateManager {
     );
   }
 
-  void markContextRead(String contextId, int unixTimestamp) {
+  void markContextRead(
+    String contextId,
+    int unixTimestamp, {
+    ContextParent? parent,
+  }) {
+    if (parent != null) {
+      recordContextParent(contextId, parent);
+    }
     _advanceContext(contextId, unixTimestamp, publishable: true);
     _contextSourceCreatedAt[contextId] = max(
       currentUnixSeconds(),
       _maxFetchedCreatedAt + 1,
     );
+  }
+
+  /// Record the parent coordinates of a `msg:`/`thread:` context, captured at
+  /// mark time where the event graph is available. Powers the
+  /// dominated-marker GC on the publish path; contexts with no recorded
+  /// parent are never GC'd. Idempotent.
+  void recordContextParent(String contextId, ContextParent parent) {
+    if (_disposed) return;
+    if (_contextParents[contextId] == parent) return;
+    _contextParents[contextId] = parent;
+    _persistLocalState();
   }
 
   void seedContextRead(String contextId, int unixTimestamp) {
@@ -144,7 +164,7 @@ class ReadStateManager {
     _unsubscribeLive = null;
     await _fetchAndMerge();
     await _startLiveSubscription();
-    if (!_isIdenticalToLastPublished(_currentContexts())) {
+    if (_hasUnpublishedChanges()) {
       _schedulePublish();
     }
     _onChanged();
@@ -341,10 +361,16 @@ class ReadStateManager {
       _onChanged();
     }
 
-    if (decoded.blob.clientId != _clientId &&
-        !_isIdenticalToLastPublished(_currentContexts())) {
+    if (decoded.blob.clientId != _clientId && _hasUnpublishedChanges()) {
       _schedulePublish();
     }
+  }
+
+  /// True when the publishable snapshot differs from the last published blob.
+  /// An unfittable snapshot (null) schedules nothing — publish would skip it.
+  bool _hasUnpublishedChanges() {
+    final contexts = _currentContexts();
+    return contexts != null && !_isIdenticalToLastPublished(contexts);
   }
 
   _ApplyRemoteContextResult _applyRemoteContextTimestamp({
@@ -395,6 +421,9 @@ class ReadStateManager {
       await _fetchOwnBlobBeforePublish();
 
       final contexts = _currentContexts();
+      if (contexts == null) {
+        return;
+      }
       if (_isIdenticalToLastPublished(contexts)) {
         return;
       }
@@ -424,12 +453,14 @@ class ReadStateManager {
       _persistLocalState();
     } catch (error) {
       if (_isOversizedReadStateError(error)) {
-        _remoteUnsupported = true;
-        _debounceTimer?.cancel();
-        _debounceTimer = null;
+        // With the publish-path GC + byte-budget trim this should be
+        // unreachable; if it fires anyway, skip THIS cycle and retry on the
+        // next debounce — silently disabling remote sync forever turned a
+        // transient condition into a permanent, invisible cross-device
+        // divergence.
         debugPrint(
-          '[ReadStateManager] remote read-state sync disabled because the '
-          'local state exceeds the NIP-44 plaintext limit.',
+          '[ReadStateManager] publish skipped: blob exceeded the NIP-44 '
+          'plaintext limit after trim (will retry on the next change)',
         );
         return;
       }
@@ -495,12 +526,44 @@ class ReadStateManager {
     return drained;
   }
 
-  Map<String, int> _currentContexts() {
+  /// Publish-ready contexts, or null when even the trimmed blob cannot fit
+  /// the byte budget (channel keys alone exceed it) — the caller skips that
+  /// publish cycle; it is NOT a terminal state.
+  Map<String, int>? _currentContexts() {
     final contexts = <String, int>{};
     for (final entry in _effectiveState.entries) {
       if (_publishableContextIds.contains(entry.key)) {
         contexts[entry.key] = entry.value;
       }
+    }
+
+    // GC before trim: every byte a dominated entry occupies is a byte that
+    // can push a LOAD-BEARING marker out of the published blob, and the trim
+    // below can evict load-bearing markers.
+    final dropped = dropDominatedContexts(contexts, _contextParents);
+    if (dropped > 0) {
+      debugPrint(
+        '[ReadStateManager] publish dropped $dropped dominated entries',
+      );
+    }
+    final trim = trimContextsToBudget(
+      contexts,
+      _clientId,
+      readStateMaxPlaintextBytes,
+      _contextSourceCreatedAt,
+    );
+    if (trim.evicted > 0) {
+      debugPrint(
+        '[ReadStateManager] publish trimmed ${trim.evicted} entries to fit '
+        'the byte budget',
+      );
+    }
+    if (!trim.fitsAfterTrim) {
+      debugPrint(
+        '[ReadStateManager] channel keys alone exceed the publish budget — '
+        'skipping this publish cycle',
+      );
+      return null;
     }
     return contexts;
   }
@@ -516,6 +579,9 @@ class ReadStateManager {
     _contextSourceCreatedAt
       ..clear()
       ..addAll(stored.sourceCreatedAt);
+    _contextParents
+      ..clear()
+      ..addAll(stored.contextParents);
     _persistLocalState();
   }
 
@@ -525,6 +591,7 @@ class ReadStateManager {
       _effectiveState,
       _publishableContextIds,
       _contextSourceCreatedAt,
+      _contextParents,
     );
   }
 

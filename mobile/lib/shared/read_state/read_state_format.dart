@@ -11,8 +11,36 @@ const _maxContexts = 10000;
 const msgContextPrefix = 'msg:';
 const threadContextPrefix = 'thread:';
 
+/// Maximum plaintext byte length for the published blob — matches desktop's
+/// READ_STATE_MAX_PLAINTEXT_BYTES (readStateFormat.ts). Ample headroom under
+/// the NIP-44 v2 65,535-byte plaintext cap after ~1.4× ciphertext expansion.
+const readStateMaxPlaintextBytes = 32768;
+
 String msgContextKey(String messageId) => '$msgContextPrefix$messageId';
 String threadContextKey(String rootId) => '$threadContextPrefix$rootId';
+
+/// Recorded parent coordinates for a `msg:`/`thread:` context, captured at
+/// mark time from the event graph. Powers the dominated-marker GC on the
+/// publish path — mirrors desktop's ContextParent (readStateFormat.ts).
+@immutable
+class ContextParent {
+  /// Channel id the context belongs to.
+  final String c;
+
+  /// Thread root event id for `msg:` contexts inside a thread; null for
+  /// top-level messages and for `thread:` contexts.
+  final String? r;
+
+  const ContextParent({required this.c, required this.r});
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is ContextParent && c == other.c && r == other.r;
+
+  @override
+  int get hashCode => Object.hash(c, r);
+}
 
 int? maxReadAt(Iterable<int?> markers) {
   int? latest;

@@ -6,6 +6,7 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import '../relay/relay.dart';
 import '../theme/theme_provider.dart';
 import '../community/community_provider.dart';
+import 'read_state_format.dart';
 import 'read_state_manager.dart';
 
 class ReadStateState {
@@ -154,6 +155,7 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
     String contextId,
     int unixTimestamp, {
     bool clearForcedMessages = false,
+    ContextParent? parent,
   }) {
     var removed = _forcedUnreadContexts.remove(contextId) != null;
     if (clearForcedMessages) {
@@ -163,7 +165,7 @@ class ReadStateNotifier extends Notifier<ReadStateState> {
       );
       removed = removed || _forcedUnreadContexts.length != before;
     }
-    _manager?.markContextRead(contextId, unixTimestamp);
+    _manager?.markContextRead(contextId, unixTimestamp, parent: parent);
     if (removed) {
       _refreshForcedState();
     }

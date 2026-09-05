@@ -690,7 +690,11 @@ class ThreadDetailPage extends HookConsumerWidget {
         for (final reply in replies) {
           ref
               .read(readStateProvider.notifier)
-              .markContextRead(msgContextKey(reply.id), reply.createdAt);
+              .markContextRead(
+                msgContextKey(reply.id),
+                reply.createdAt,
+                parent: ContextParent(c: channelId, r: queryRootId),
+              );
         }
       });
       return null;
@@ -752,7 +756,11 @@ class ThreadDetailPage extends HookConsumerWidget {
         if (boundary <= effectiveThreadReadAt) return;
         ref
             .read(readStateProvider.notifier)
-            .markContextRead(threadContextKey(queryRootId), boundary);
+            .markContextRead(
+              threadContextKey(queryRootId),
+              boundary,
+              parent: ContextParent(c: channelId, r: null),
+            );
       });
       return null;
     }, [threadHead.id, readState, relayRepliesAvailable, subtreeReadKey]);
