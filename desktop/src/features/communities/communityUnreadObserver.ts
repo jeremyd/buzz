@@ -102,9 +102,27 @@ const MENTION_COUNT_LIMIT = 100;
 const READ_STATE_FETCH_LIMIT = 500;
 const READ_STATE_HORIZON_SECONDS = 7 * 24 * 60 * 60;
 
+/** One event the observer counted as unread — enough detail for in-app
+ * surfaces to display and clear it (the badge must never count something the
+ * user cannot see or act on). */
+export type CommunityUnreadEventDetail = {
+  channelId: string;
+  channelType: ChannelType;
+  id: string;
+  createdAt: number;
+  rootId: string | null;
+  mention: boolean;
+};
+
+// Bound on retained per-community unread detail. Mention detail is complete
+// (the numeric badge is the mention count); dot-only detail may be partial
+// because the existence fetch short-circuits once any unread is found.
+const UNREAD_DETAIL_LIMIT = 200;
+
 export type CommunityUnreadObserverResult = {
   hasUnread: boolean;
   mentionCount: number;
+  unreadEvents: CommunityUnreadEventDetail[];
 };
 
 type CommunityUnreadRelay = {
@@ -188,7 +206,7 @@ export async function fetchCommunityUnread(args: {
 
   const channels = await fetchObservedChannels(client, pubkey);
   if (channels.length === 0) {
-    return { hasUnread: false, mentionCount: 0 };
+    return { hasUnread: false, mentionCount: 0, unreadEvents: [] };
   }
 
   const [readStateEvents, mutesEvents] = await Promise.all([
@@ -244,6 +262,33 @@ export async function fetchCommunityUnread(args: {
 
   let hasUnread = false;
   let mentionCount = 0;
+  const unreadEvents: CommunityUnreadEventDetail[] = [];
+  const detailIds = new Set<string>();
+  const recordDetail = (
+    channel: ObservedChannel,
+    event: RelayEvent,
+    mention: boolean,
+  ) => {
+    if (detailIds.has(event.id)) {
+      if (mention) {
+        const existing = unreadEvents.find((entry) => entry.id === event.id);
+        if (existing) existing.mention = true;
+      }
+      return;
+    }
+    if (unreadEvents.length >= UNREAD_DETAIL_LIMIT) return;
+    detailIds.add(event.id);
+    unreadEvents.push({
+      channelId: channel.id,
+      channelType: channel.channelType,
+      id: event.id,
+      createdAt: event.created_at,
+      rootId: isBroadcastReply(event.tags)
+        ? null
+        : getThreadReference(event.tags).rootId,
+      mention,
+    });
+  };
 
   for (const channel of channels) {
     if (mutedIds.has(channel.id)) continue;
@@ -288,13 +333,13 @@ export async function fetchCommunityUnread(args: {
       limit: MENTION_COUNT_LIMIT,
     });
 
-    const [unreadEvents, mentionEvents] = await Promise.all([
+    const [channelUnreadEvents, mentionEvents] = await Promise.all([
       unreadEventsPromise,
       mentionEventsPromise,
     ]);
 
     if (!hasUnread) {
-      hasUnread = unreadEvents.some(
+      const unreadCandidates = channelUnreadEvents.filter(
         (event) =>
           isUnreadExternalEvent(event, readState, readAt, normalizedPubkey) &&
           shouldNotifyForEvent(event, normalizedPubkey, {
@@ -306,14 +351,26 @@ export async function fetchCommunityUnread(args: {
             channelId: channel.id,
           }),
       );
+      hasUnread = unreadCandidates.length > 0;
+      for (const event of unreadCandidates) {
+        recordDetail(channel, event, false);
+      }
     }
 
-    mentionCount += mentionEvents.filter((event) =>
+    const unreadMentions = mentionEvents.filter((event) =>
       isUnreadExternalEvent(event, readState, readAt, normalizedPubkey),
-    ).length;
+    );
+    mentionCount += unreadMentions.length;
+    for (const event of unreadMentions) {
+      recordDetail(channel, event, true);
+    }
   }
 
-  return { hasUnread: hasUnread || mentionCount > 0, mentionCount };
+  return {
+    hasUnread: hasUnread || mentionCount > 0,
+    mentionCount,
+    unreadEvents,
+  };
 }
 
 export function extractMemberChannelIds(events: RelayEvent[]): string[] {

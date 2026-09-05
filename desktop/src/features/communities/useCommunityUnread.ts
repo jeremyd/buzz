@@ -2,6 +2,7 @@ import * as React from "react";
 
 import { getIdentity } from "@/shared/api/tauriIdentity";
 import { markCommunityRead } from "@/features/communities/communityMarkRead";
+import { persistObserverUnreadDetail } from "@/features/communities/communityUnreadDetailCache";
 import { pollCommunityUnread } from "@/features/communities/communityUnreadObserver";
 
 import type { Community } from "./types";
@@ -135,6 +136,11 @@ export function useCommunityUnread(
         try {
           const result = await pollCommunityUnread(community, pubkey);
           if (cancelled) return;
+          persistObserverUnreadDetail(
+            pubkey,
+            community.relayUrl,
+            result.unreadEvents,
+          );
           markReady(community.id, result);
         } catch (error) {
           console.debug(

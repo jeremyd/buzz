@@ -25,6 +25,12 @@ function readRelationships(overrides = {}) {
   return () => ({ ...EMPTY_RELATIONSHIPS, ...overrides });
 }
 
+// Badge-level projection of the observer result. Most tests assert the badge
+// verdict; unread-detail content has its own dedicated tests below.
+function summary(result) {
+  return { hasUnread: result.hasUnread, mentionCount: result.mentionCount };
+}
+
 function event(overrides = {}) {
   return {
     id: overrides.id ?? `${Math.random()}`.padEnd(64, "0").slice(0, 64),
@@ -178,7 +184,7 @@ test("fetchCommunityUnread returns dot and mention count without total unread co
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 1 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 1 });
   assert.equal(relay.requests.at(-1)["#p"][0], PUBKEY);
 });
 
@@ -260,7 +266,7 @@ test("fetchCommunityUnread ignores self-authored and read thread/message events"
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread excludes muted-only channel — returns hasUnread:false mentionCount:0", async () => {
@@ -308,7 +314,7 @@ test("fetchCommunityUnread excludes muted-only channel — returns hasUnread:fal
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread counts unmuted channel but skips muted channel", async () => {
@@ -382,7 +388,7 @@ test("fetchCommunityUnread counts unmuted channel but skips muted channel", asyn
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 1 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 1 });
 });
 
 test("fetchCommunityUnread treats decryption failure as empty mutes set", async () => {
@@ -440,7 +446,7 @@ test("fetchCommunityUnread treats decryption failure as empty mutes set", async 
   });
 
   // Channel counted as if no mutes
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread treats absent mutes blob as empty mutes set", async () => {
@@ -490,7 +496,7 @@ test("fetchCommunityUnread treats absent mutes blob as empty mutes set", async (
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 // ── Thread-relevance gate tests ────────────────────────────────────────────
@@ -557,7 +563,7 @@ test("fetchCommunityUnread threaded reply in untracked root → hasUnread:false"
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread threaded reply in participatedRootIds → hasUnread:true", async () => {
@@ -574,7 +580,7 @@ test("fetchCommunityUnread threaded reply in participatedRootIds → hasUnread:t
     }),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread #p-mention reply in untracked root → hasUnread:true (mention overrides)", async () => {
@@ -595,7 +601,7 @@ test("fetchCommunityUnread #p-mention reply in untracked root → hasUnread:true
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread top-level post → hasUnread:true (no thread gate)", async () => {
@@ -617,7 +623,7 @@ test("fetchCommunityUnread top-level post → hasUnread:true (no thread gate)", 
     readThreadRelationships: readRelationships(),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread threaded reply whose root is in mutedRootIds → hasUnread:false", async () => {
@@ -638,7 +644,7 @@ test("fetchCommunityUnread threaded reply whose root is in mutedRootIds → hasU
     }),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 // ── Forced-unread persistence gate tests ─────────────────────────────────
@@ -741,7 +747,7 @@ test("fetchCommunityUnread forced-unread channel lights rail dot (hasUnread:true
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread forced-unread channel not in member list → hasUnread:false", async () => {
@@ -762,7 +768,7 @@ test("fetchCommunityUnread forced-unread channel not in member list → hasUnrea
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread forced-unread channel that is also muted → hasUnread:false", async () => {
@@ -810,7 +816,7 @@ test("fetchCommunityUnread forced-unread channel that is also muted → hasUnrea
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread readForcedUnread returns empty map → falls through to relay gate", async () => {
@@ -862,7 +868,7 @@ test("fetchCommunityUnread readForcedUnread returns empty map → falls through 
     readForcedUnread: () => ({}), // empty — no forced-unread
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread forced-unread + synced marker advanced PAST baseline → hasUnread:false", async () => {
@@ -880,7 +886,7 @@ test("fetchCommunityUnread forced-unread + synced marker advanced PAST baseline 
     readForcedUnread: () => ({ [CHANNEL_ID]: 50 }),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread forced-unread + synced marker NOT advanced past baseline → hasUnread:true", async () => {
@@ -898,7 +904,7 @@ test("fetchCommunityUnread forced-unread + synced marker NOT advanced past basel
     readForcedUnread: () => ({ [CHANNEL_ID]: 100 }),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 // ── Local read-state fold tests (phantom-badge regression) ────────────────
@@ -982,7 +988,7 @@ test("fetchCommunityUnread local msg: marker covers a reply the published blob n
     readLocalReadState: () => new Map([[`msg:${EVICTED_COVER_REPLY_ID}`, 50]]),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread falsifiability control: identical fixture, relay-only view → unread", async () => {
@@ -1002,7 +1008,7 @@ test("fetchCommunityUnread falsifiability control: identical fixture, relay-only
     readLocalReadState: () => new Map(),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 1 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 1 });
 });
 
 test("fetchCommunityUnread local thread: marker covers a reply the blob does not cover", async () => {
@@ -1018,7 +1024,7 @@ test("fetchCommunityUnread local thread: marker covers a reply the blob does not
     readLocalReadState: () => new Map([[`thread:${THREAD_ROOT_2}`, 50]]),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread stale local marker does not mask a newer relay marker (merge is max)", async () => {
@@ -1036,7 +1042,7 @@ test("fetchCommunityUnread stale local marker does not mask a newer relay marker
     readLocalReadState: () => new Map([[CHANNEL_ID, 10]]),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread forced-unread suppressed when LOCAL marker advanced past baseline", async () => {
@@ -1053,7 +1059,7 @@ test("fetchCommunityUnread forced-unread suppressed when LOCAL marker advanced p
     readLocalReadState: () => new Map([[CHANNEL_ID, 50]]),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread forced-unread still lights when local marker has not passed baseline", async () => {
@@ -1068,7 +1074,7 @@ test("fetchCommunityUnread forced-unread still lights when local marker has not 
     readLocalReadState: () => new Map([[CHANNEL_ID, 30]]),
   });
 
-  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: true, mentionCount: 0 });
 });
 
 test("fetchCommunityUnread forced-unread with null baseline + synced marker present → hasUnread:false", async () => {
@@ -1087,5 +1093,51 @@ test("fetchCommunityUnread forced-unread with null baseline + synced marker pres
     readForcedUnread: () => ({ [CHANNEL_ID]: null }),
   });
 
-  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
+});
+
+// ── Unread-detail retention (actionable badge) ────────────────────────────
+
+test("fetchCommunityUnread retains detail for the events it counts", async () => {
+  const result = await fetchCommunityUnread({
+    client: phantomBadgeRelay({ [CHANNEL_ID]: 10 }),
+    pubkey: PUBKEY,
+    nowSeconds: 100,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships({
+      participatedRootIds: new Set([THREAD_ROOT_2]),
+    }),
+    readLocalReadState: () => new Map(),
+  });
+
+  // The reply is served by both the existence and mention fetches — one
+  // detail entry, flagged as a mention.
+  assert.deepEqual(result.unreadEvents, [
+    {
+      channelId: CHANNEL_ID,
+      channelType: "stream",
+      id: EVICTED_COVER_REPLY_ID,
+      createdAt: 50,
+      rootId: THREAD_ROOT_2,
+      mention: true,
+    },
+  ]);
+});
+
+test("fetchCommunityUnread retains no detail for covered events", async () => {
+  const result = await fetchCommunityUnread({
+    client: phantomBadgeRelay({ [CHANNEL_ID]: 10 }),
+    pubkey: PUBKEY,
+    nowSeconds: 100,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships({
+      participatedRootIds: new Set([THREAD_ROOT_2]),
+    }),
+    readLocalReadState: () => new Map([[`msg:${EVICTED_COVER_REPLY_ID}`, 50]]),
+  });
+
+  assert.deepEqual(summary(result), { hasUnread: false, mentionCount: 0 });
+  assert.deepEqual(result.unreadEvents, []);
 });

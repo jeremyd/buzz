@@ -258,7 +258,7 @@ test("markAllRead covers a channel whose only unread is a thread reply", async (
   const after = await fetchCommunityUnread(observerArgs);
   assert.deepEqual(
     after,
-    { hasUnread: false, mentionCount: 0 },
+    { hasUnread: false, mentionCount: 0, unreadEvents: [] },
     "the {channel: now} marker covers the thread reply via the hierarchical fold",
   );
 });
