@@ -26,6 +26,7 @@ jobs:
     env:
       TARGET: ${{ inputs.target }}
       HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      HAS_GITLAB_TOKEN: ${{ secrets.GITLAB_DEPLOY_TOKEN != '' }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -43,6 +44,9 @@ jobs:
         run: |
           BASE_VERSION=$(node -p "require('./desktop/package.json').version")
           VERSION="${BASE_VERSION%%-*}-fork.${GITHUB_RUN_NUMBER}"
+          # Registry package version matches the GitLab fork CI convention
+          # (scripts/fork-version.sh there): v<package.json version>-<short sha>.
+          echo "PKG_VERSION=v${BASE_VERSION%%-*}-${GITHUB_SHA:0:8}" >> "$GITHUB_ENV"
           cd desktop && node scripts/set-version-from-tag.mjs "$VERSION"
           cd src-tauri && cargo update --workspace
 
@@ -124,6 +128,23 @@ jobs:
           path: ${{ steps.artifact.outputs.dmg }}
           if-no-files-found: error
           retention-days: 7
+
+      - name: Publish DMG to code.relay.tools package registry
+        if: env.HAS_GITLAB_TOKEN == 'true'
+        env:
+          GITLAB_DEPLOY_TOKEN: ${{ secrets.GITLAB_DEPLOY_TOKEN }}
+          DMG: ${{ steps.artifact.outputs.dmg }}
+        run: |
+          case "$TARGET" in
+            aarch64-*) ARCH=arm64 ;;
+            *) ARCH=x86_64 ;;
+          esac
+          NAME="buzz-${PKG_VERSION}-macos-${ARCH}.dmg"
+          URL="https://code.relay.tools/api/v4/projects/forks%2Fbuzz/packages/generic/buzz-desktop-macos/${PKG_VERSION}/${NAME}"
+          echo "Uploading ${NAME} -> ${URL}"
+          curl --fail-with-body -sS -H "DEPLOY-TOKEN: ${GITLAB_DEPLOY_TOKEN}" --upload-file "$DMG" "$URL"
+          echo
+          echo "Published under Deploy → Package registry → buzz-desktop-macos ${PKG_VERSION}"
 
       - name: Measure release Cargo cache inputs
         if: always()
