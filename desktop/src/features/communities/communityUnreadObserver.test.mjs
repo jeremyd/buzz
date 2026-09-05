@@ -901,6 +901,176 @@ test("fetchCommunityUnread forced-unread + synced marker NOT advanced past basel
   assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
 });
 
+// ── Local read-state fold tests (phantom-badge regression) ────────────────
+//
+// The published blob is trimmed to a byte budget, so a `msg:`/`thread:` marker
+// this device relies on can be evicted from it while local storage still holds
+// it. The observer must fold local state over the relay view — otherwise it
+// lights a badge no in-app surface can display or clear (the Sep 2026 phantom
+// "2" on buzz.relay.tools).
+
+const EVICTED_COVER_REPLY_ID = "evicted-cover".padEnd(64, "0");
+
+// One member channel whose published blob carries only the given contexts, and
+// one externally-authored thread reply (created_at 50, root THREAD_ROOT_2,
+// @-mentioning the user) served by both the unread and mention fetches —
+// modeled directly on the live repro.
+function phantomBadgeRelay(blobContexts) {
+  const reply = threadedReplyEvent({
+    id: EVICTED_COVER_REPLY_ID,
+    created_at: 50,
+    extraTags: [["p", PUBKEY]],
+  });
+  return relayFor([
+    // 1. member events
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["p", PUBKEY],
+        ],
+      }),
+    ],
+    // 2. metadata events (parallel with visibility)
+    () => [
+      event({
+        tags: [
+          ["d", CHANNEL_ID],
+          ["t", "stream"],
+        ],
+      }),
+    ],
+    // 3. visibility events
+    () => [],
+    // 4. read-state events (parallel with mutes)
+    () => [
+      event({
+        pubkey: PUBKEY,
+        created_at: 200,
+        tags: [
+          ["d", "read-state:test"],
+          ["t", "read-state"],
+        ],
+        content: JSON.stringify({
+          v: 1,
+          client_id: "client",
+          contexts: blobContexts,
+        }),
+      }),
+    ],
+    // 5. mutes events
+    () => [],
+    // 6. unread events
+    () => [reply],
+    // 7. mention events
+    () => [reply],
+  ]);
+}
+
+test("fetchCommunityUnread local msg: marker covers a reply the published blob no longer covers", async () => {
+  // Blob: channel marker only (the msg: cover was evicted by the byte budget).
+  // Local: the exact-tie msg: marker survives — ties count as read.
+  const result = await fetchCommunityUnread({
+    client: phantomBadgeRelay({ [CHANNEL_ID]: 10 }),
+    pubkey: PUBKEY,
+    nowSeconds: 100,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships({
+      participatedRootIds: new Set([THREAD_ROOT_2]),
+    }),
+    readLocalReadState: () => new Map([[`msg:${EVICTED_COVER_REPLY_ID}`, 50]]),
+  });
+
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread falsifiability control: identical fixture, relay-only view → unread", async () => {
+  // Same relay state as the covering test, but no local state — this is
+  // exactly the pre-fold observer verdict and must stay unread. If the
+  // covering test ever passes while this one fails, the fold is not the
+  // thing making it pass.
+  const result = await fetchCommunityUnread({
+    client: phantomBadgeRelay({ [CHANNEL_ID]: 10 }),
+    pubkey: PUBKEY,
+    nowSeconds: 100,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships({
+      participatedRootIds: new Set([THREAD_ROOT_2]),
+    }),
+    readLocalReadState: () => new Map(),
+  });
+
+  assert.deepEqual(result, { hasUnread: true, mentionCount: 1 });
+});
+
+test("fetchCommunityUnread local thread: marker covers a reply the blob does not cover", async () => {
+  const result = await fetchCommunityUnread({
+    client: phantomBadgeRelay({ [CHANNEL_ID]: 10 }),
+    pubkey: PUBKEY,
+    nowSeconds: 100,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships({
+      participatedRootIds: new Set([THREAD_ROOT_2]),
+    }),
+    readLocalReadState: () => new Map([[`thread:${THREAD_ROOT_2}`, 50]]),
+  });
+
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread stale local marker does not mask a newer relay marker (merge is max)", async () => {
+  // Relay channel marker (60) is ahead of local (10). Max-merge must keep 60,
+  // covering the reply at 50 — a local-overrides merge would resurrect it.
+  const result = await fetchCommunityUnread({
+    client: phantomBadgeRelay({ [CHANNEL_ID]: 60 }),
+    pubkey: PUBKEY,
+    nowSeconds: 100,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships({
+      participatedRootIds: new Set([THREAD_ROOT_2]),
+    }),
+    readLocalReadState: () => new Map([[CHANNEL_ID, 10]]),
+  });
+
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread forced-unread suppressed when LOCAL marker advanced past baseline", async () => {
+  // No relay read state at all; the local channel marker (50) has passed the
+  // forced baseline (40) — the fold must reach the forced-unread gate too.
+  const result = await fetchCommunityUnread({
+    client: quietRelay(),
+    pubkey: PUBKEY,
+    nowSeconds: 200,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    readForcedUnread: () => ({ [CHANNEL_ID]: 40 }),
+    readLocalReadState: () => new Map([[CHANNEL_ID, 50]]),
+  });
+
+  assert.deepEqual(result, { hasUnread: false, mentionCount: 0 });
+});
+
+test("fetchCommunityUnread forced-unread still lights when local marker has not passed baseline", async () => {
+  const result = await fetchCommunityUnread({
+    client: quietRelay(),
+    pubkey: PUBKEY,
+    nowSeconds: 200,
+    decryptReadState: async (v) => v,
+    decryptMutes: async (v) => v,
+    readThreadRelationships: readRelationships(),
+    readForcedUnread: () => ({ [CHANNEL_ID]: 40 }),
+    readLocalReadState: () => new Map([[CHANNEL_ID, 30]]),
+  });
+
+  assert.deepEqual(result, { hasUnread: true, mentionCount: 0 });
+});
+
 test("fetchCommunityUnread forced-unread with null baseline + synced marker present → hasUnread:false", async () => {
   // markerAtWhenForced = null (no marker at force-time), but readAt = 50 now
   // A cross-device read appeared after the force → do NOT light the dot

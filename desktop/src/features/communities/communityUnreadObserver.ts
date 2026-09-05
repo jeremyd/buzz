@@ -5,7 +5,11 @@ import {
   type ForcedUnreadMap,
 } from "@/features/channels/forcedUnreadStore";
 import { DM_NOTIFIABLE_EVENT_KINDS } from "@/features/channels/isDmNotifiableKind";
-import { mergeReadStateEvents } from "@/features/channels/readState/readStateSnapshot";
+import {
+  mergeReadStateEvents,
+  mergeReadStateMaps,
+} from "@/features/channels/readState/readStateSnapshot";
+import { readStoredReadState } from "@/features/channels/readState/readStateStorage";
 import {
   maxReadAt,
   msgContextKey,
@@ -70,6 +74,15 @@ function readFollowedRootIds(pubkey: string): Set<string> {
     return ids;
   } catch {
     return new Set();
+  }
+}
+
+function defaultLocalReadState(pubkey: string): ReadonlyMap<string, number> {
+  try {
+    return readStoredReadState(pubkey).contexts;
+  } catch {
+    // Storage unavailable → degrade to the relay-published view alone.
+    return new Map();
   }
 }
 
@@ -161,6 +174,7 @@ export async function fetchCommunityUnread(args: {
   decryptMutes?: (ciphertext: string) => Promise<string>;
   readThreadRelationships?: (pubkey: string) => ThreadRelationships;
   readForcedUnread?: (pubkey: string) => ForcedUnreadMap;
+  readLocalReadState?: (pubkey: string) => ReadonlyMap<string, number>;
 }): Promise<CommunityUnreadObserverResult> {
   const { client, pubkey } = args;
   const normalizedPubkey = pubkey.toLowerCase();
@@ -170,6 +184,7 @@ export async function fetchCommunityUnread(args: {
     args.readThreadRelationships ?? defaultReadThreadRelationships;
   const readForcedUnread =
     args.readForcedUnread ?? ((pk) => forcedUnreadStore.read(pk));
+  const readLocalReadState = args.readLocalReadState ?? defaultLocalReadState;
 
   const channels = await fetchObservedChannels(client, pubkey);
   if (channels.length === 0) {
@@ -192,10 +207,14 @@ export async function fetchCommunityUnread(args: {
     }),
   ]);
 
-  const readState = await mergeReadStateEvents(
-    readStateEvents,
-    pubkey,
-    args.decryptReadState,
+  // Fold this device's local read state over the relay-published view. The
+  // published blob is trimmed to a byte budget, so markers this device relies
+  // on may be evicted from it; local state is a superset (remote merges are
+  // advance-only), and a device must never light a badge for an event it
+  // locally knows is read. Max-merge keeps whichever side is further ahead.
+  const readState = mergeReadStateMaps(
+    await mergeReadStateEvents(readStateEvents, pubkey, args.decryptReadState),
+    readLocalReadState(pubkey),
   );
 
   let mutedIds = new Set<string>();

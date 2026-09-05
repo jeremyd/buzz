@@ -314,3 +314,33 @@ android-apk:
       curl --fail-with-body -sS -H "JOB-TOKEN: ${CI_JOB_TOKEN}" --upload-file "$APK" "$URL"
       echo
       echo "Published under Deploy → Package registry → buzz-android ${VERSION}"
+
+# macOS DMG rides GitHub's hosted Apple runners (this instance has none):
+# mirror-push the exact commit under build to the gitlab-ci branch of the
+# github.com/jeremyd/buzz build-farm fork, then dispatch its
+# fork-macos-build.yml pinned to that SHA. That workflow publishes the DMG
+# back into THIS project's registry as buzz-desktop-macos with the same
+# v<version>-<short sha> package version as the jobs above (it derives the
+# version from the checked-out HEAD, matching scripts/fork-version.sh).
+# GITHUB_MACOS_TRIGGER_TOKEN is a masked+protected CI variable (GitHub token
+# with repo scope on jeremyd/buzz). Runs in parallel with the other build
+# jobs; the macOS build takes ~15-30 min on GitHub's side.
+trigger-macos:
+  stage: build
+  image: alpine:3.20
+  timeout: 15m
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  variables:
+    # Full clone: pushing from a shallow checkout is rejected by the remote.
+    GIT_DEPTH: "0"
+  script:
+    - apk add --no-cache git curl
+    - git push --force "https://x-access-token:${GITHUB_MACOS_TRIGGER_TOKEN}@github.com/jeremyd/buzz.git" "HEAD:refs/heads/gitlab-ci"
+    - |
+      curl --fail-with-body -sS -X POST \
+        -H "Authorization: Bearer ${GITHUB_MACOS_TRIGGER_TOKEN}" \
+        -H "Accept: application/vnd.github+json" \
+        "https://api.github.com/repos/jeremyd/buzz/actions/workflows/fork-macos-build.yml/dispatches" \
+        -d "{\"ref\":\"main\",\"inputs\":{\"target\":\"aarch64-apple-darwin\",\"checkout_ref\":\"${CI_COMMIT_SHA}\"}}"
+      echo "Dispatched fork-macos-build for ${CI_COMMIT_SHA} -> https://github.com/jeremyd/buzz/actions"

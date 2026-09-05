@@ -76,6 +76,26 @@ export async function mergeReadStateEvents(
   return contexts;
 }
 
+/**
+ * Merge two read-state context maps, keeping the per-context maximum.
+ * Read markers are monotonic (a later read always supersedes an earlier one),
+ * so max-merge is the only lossless combination of two independently-sourced
+ * views of the same pubkey's read state.
+ */
+export function mergeReadStateMaps(
+  base: ReadonlyMap<string, number>,
+  overlay: ReadonlyMap<string, number>,
+): Map<string, number> {
+  const merged = new Map(base);
+  for (const [contextId, timestamp] of overlay) {
+    const current = merged.get(contextId) ?? 0;
+    if (timestamp > current) {
+      merged.set(contextId, timestamp);
+    }
+  }
+  return merged;
+}
+
 export function getSnapshotReadTimestamp(
   contexts: ReadonlyMap<string, number>,
   contextId: string,
